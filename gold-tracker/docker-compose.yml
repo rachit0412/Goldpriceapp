@@ -1,0 +1,26 @@
+services:
+  gold-tracker:
+    build: .
+    image: aurum-ledger:local
+    ports:
+      - "127.0.0.1:${HOST_PORT:-3080}:3000"
+    environment:
+      DATABASE_PATH: /app/data/gold.sqlite
+      GOLD_API_KEY: ${GOLD_API_KEY:-}
+      REFRESH_SECONDS: ${REFRESH_SECONDS:-300}
+      STALE_SECONDS: ${STALE_SECONDS:-3600}
+      FX_STALE_SECONDS: ${FX_STALE_SECONDS:-345600}
+      ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
+      ALERT_WEBHOOK_TOKEN: ${ALERT_WEBHOOK_TOKEN:-}
+      APP_ORIGIN: ${APP_ORIGIN:-}
+      RAKSHA_QUOTE_GRAMS: ${RAKSHA_QUOTE_GRAMS:-}
+    volumes:
+      - gold-data:/app/data
+    restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+volumes:
+  gold-data:
