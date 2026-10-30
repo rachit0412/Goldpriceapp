@@ -13,7 +13,7 @@ services:
       ALERT_WEBHOOK_URL: ${ALERT_WEBHOOK_URL:-}
       ALERT_WEBHOOK_TOKEN: ${ALERT_WEBHOOK_TOKEN:-}
       APP_ORIGIN: ${APP_ORIGIN:-}
-      RAKSHA_QUOTE_GRAMS: ${RAKSHA_QUOTE_GRAMS:-}
+      RAKSHA_QUOTE_GRAMS: ${RAKSHA_QUOTE_GRAMS:-10}
     volumes:
       - gold-data:/app/data
     restart: unless-stopped

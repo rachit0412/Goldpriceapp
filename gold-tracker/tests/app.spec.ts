@@ -1,4 +1,6 @@
 import { test, expect } from "@playwright/test";
+import { readFile } from "node:fs/promises";
+import Papa from "papaparse";
 
 test.afterEach(async ({ request, baseURL }) => {
   const response = await request.get("/api/state");
@@ -131,7 +133,14 @@ test("purchase create edit CSV export import and delete", async ({ page }) => {
   const download = await downloadWait;
   const path = await download.path();
   expect(path).toBeTruthy();
-  await page.getByLabel("Import purchases CSV").setInputFiles(path!);
+  const exported = Papa.parse<Record<string, string>>(await readFile(path!, "utf8"), { header: true, skipEmptyLines: "greedy" });
+  expect(exported.errors).toEqual([]);
+  const ownRows = exported.data.filter(row => row.label === "SMOKE_LEDGER");
+  expect(ownRows).toHaveLength(1);
+  await page.getByLabel("Import purchases CSV").setInputFiles({
+    name: "smoke-ledger.csv", mimeType: "text/csv",
+    buffer: Buffer.from(Papa.unparse(ownRows)),
+  });
   await expect(page.locator(".ledger tbody tr").filter({ hasText: "SMOKE_LEDGER" })).toHaveCount(2);
   page.on("dialog", (dialog) => dialog.accept());
   await page
@@ -206,28 +215,40 @@ test("stale provider state is clearly labelled", async ({ page }) => {
   await expect(
     page.getByText("Stale / partial data", { exact: true }),
   ).toBeVisible();
-  await expect(page.getByRole("status")).toContainText(
+  await expect(page.getByRole("status").filter({ hasText: "Stale data:" })).toContainText(
     "Alert evaluation is paused",
   );
 });
 
-test("chart renders labelled interactive history using test-only fixture", async ({
+test("seven-day chart defaults to today-inclusive hourly observations", async ({
   page,
+  request,
 }) => {
-  const points = [0, 1, 2].map((index) => ({
-    date: `2026-10-${27 + index}`,
-    fxDate: `2026-10-${27 + index}`,
-    usd: 3000 + index * 10,
-    EUR: 2700 + index * 9,
-    INR: 270000 + index * 900,
-  }));
+  const liveResponse = await request.get("/api/history?days=7");
+  expect(liveResponse.ok()).toBe(true);
+  const liveHistory = await liveResponse.json();
+  expect(liveHistory.method).toContain("Standard Bullion");
+  expect(liveHistory.value.length).toBeGreaterThan(2);
+  const today = new Date().toISOString().slice(0, 10);
+  expect(liveHistory.value.some((point: { date: string }) => point.date.slice(0, 10) === today)).toBe(true);
+  expect(liveHistory.stale).toBe(false);
+  const now = Date.now();
+  const points = [6 * 86400000, 86400000, 120000, 60000].map((age, index) => {
+    const observed = new Date(now - age).toISOString();
+    return {
+      date: observed,
+      fxDate: observed.slice(0, 10),
+      usd: 3000 + index * 10,
+      EUR: 2700 + index * 9,
+      INR: 270000 + index * 900,
+    };
+  });
   await page.route("**/api/history**", (route) =>
     route.fulfill({
       json: {
         value: points,
         error: null,
         method: "TEST FIXTURE ONLY",
-        authenticated: true,
         stale: false,
       },
     }),
@@ -235,13 +256,114 @@ test("chart renders labelled interactive history using test-only fixture", async
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto("/");
   await expect(
-    page.getByRole("img", { name: /gold daily history/ }),
+    page
+      .getByRole("group", { name: "History range" })
+      .getByRole("button", { name: "7D", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.getByRole("img", { name: /gold observations over the selected range/ }),
   ).toBeVisible();
+  const chartPurity = page.getByRole("group", { name: "Chart purity" });
+  await expect(chartPurity.getByRole("button", { name: "24K", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator(".recharts-area-curve")).toHaveAttribute("d", /M/);
   await page.getByText("View observations (3)", { exact: true }).click();
   await expect(page.locator(".history-table tbody tr")).toHaveCount(3);
-  await page.screenshot({
-    path: "artifacts/chart-test-fixture.png",
-    fullPage: true,
+  const detail = page.getByRole("group", { name: "Observation table detail", exact: true });
+  await detail.getByRole("button", { name: "All observations", exact: true }).click();
+  await expect(page.locator(".history-table tbody tr")).toHaveCount(4);
+  await detail.getByRole("button", { name: "Daily", exact: true }).click();
+  await expect(page.locator(".history-table tbody tr")).toHaveCount(3);
+  const value24k = await page.locator(".history-table tbody tr").first().locator("td").nth(1).innerText();
+  await chartPurity.getByRole("button", { name: "22K", exact: true }).click();
+  await expect(chartPurity.getByRole("button", { name: "22K", exact: true })).toHaveAttribute("aria-pressed", "true");
+  const value22k = await page.locator(".history-table tbody tr").first().locator("td").nth(1).innerText();
+  expect(value22k).not.toBe(value24k);
+  await chartPurity.getByRole("button", { name: "18K", exact: true }).click();
+  await expect(chartPurity.getByRole("button", { name: "18K", exact: true })).toHaveAttribute("aria-pressed", "true");
+  const value18k = await page.locator(".history-table tbody tr").first().locator("td").nth(1).innerText();
+  expect(value18k).not.toBe(value22k);
+  await page.getByRole("group", { name: "Chart currency" }).getByRole("button", { name: "EUR", exact: true }).click();
+  await expect(page.locator(".history-table thead")).toContainText("EUR/g");
+  await expect(page.getByLabel("Selected range price change")).toContainText("Change from first observation");
+  await expect(page.locator(".history-table tbody tr").last()).toContainText(
+    new Date(points.at(-1)!.date).toLocaleDateString("en", { timeZone: "UTC", dateStyle: "medium" }),
+  );
+});
+
+test("country charts stay separate, persist country and refresh automatically", async ({ page, request }) => {
+  const liveResponse = await request.get("/api/history?country=India&days=7");
+  expect(liveResponse.ok()).toBe(true);
+  const live = await liveResponse.json();
+  expect(live.source).toContain("IBJA");
+  expect(live.grain).toBe("daily");
+  expect(live.value.length).toBeGreaterThanOrEqual(7);
+  expect(new Set(live.value.map((point: { date: string }) => point.date)).size).toBeGreaterThanOrEqual(7);
+  expect(live.error).toBeNull();
+  await page.clock.install();
+  let indianLoads = 0;
+  const now = Date.now();
+  await page.route("**/api/history**", async route => {
+    const url = new URL(route.request().url());
+    const country = url.searchParams.get("country") || "Netherlands";
+    if (country === "India") indianLoads++;
+    const point = (timestamp: number, amount: number) => ({
+      date: new Date(timestamp).toISOString(), fxDate: new Date(timestamp).toISOString().slice(0, 10),
+      INR: amount * 31.1034768, EUR: amount / 100 * 31.1034768, usd: amount / 90 * 31.1034768,
+    });
+    const points = country === "India"
+      ? Array.from({ length: 7 }, (_, index) => ({
+        ...point(now - (6 - index) * 86400000, 10000 + index * 100 + (index === 6 ? indianLoads : 0)),
+        date: new Date(now - (6 - index) * 86400000).toISOString().slice(0, 10),
+      }))
+      : [point(now - 86400000, 11000), point(now, 11100)];
+    await route.fulfill({ json: {
+      country, value: points, stale: false, error: null,
+      grain: country === "India" ? "daily" : undefined,
+      retrievedAt: points.at(-1)!.date,
+      method: `TEST FIXTURE ONLY · ${country}`,
+    } });
   });
+  await page.goto("/");
+  const countries = page.getByRole("group", { name: "Chart country", exact: true });
+  const chartPurity = page.getByRole("group", { name: "Chart purity", exact: true });
+  await expect(countries.getByRole("button", { name: "Netherlands", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("group", { name: "Chart currency", exact: true }).getByRole("button", { name: "EUR", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await chartPurity.getByRole("button", { name: "14K", exact: true }).click();
+  await countries.getByRole("button", { name: "India", exact: true }).click();
+  await expect(chartPurity.getByRole("button", { name: "14K", exact: true })).toHaveCount(0);
+  await expect(chartPurity.getByRole("button", { name: "24K", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await page.getByText("View observations (7)", { exact: true }).click();
+  await expect(page.locator(".history-table tbody tr")).toHaveCount(7);
+  await expect(page.locator(".history-table thead")).toContainText("Publication date (India)");
+  await expect(page.locator(".history-table tbody")).toContainText("₹10,601.00");
+  await page.clock.fastForward(61000);
+  await expect.poll(() => indianLoads).toBeGreaterThan(1);
+  await expect(page.locator(".history-table tbody")).toContainText("₹10,602.00");
+  await page.reload();
+  await expect(countries.getByRole("button", { name: "India", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByLabel("India chart product")).toHaveCount(0);
+  await countries.getByRole("button", { name: "Netherlands", exact: true }).click();
+  await expect(page.getByText("View observations (2)", { exact: true })).toBeVisible();
+  await expect(page.getByLabel("India chart product")).toHaveCount(0);
+  await expect(chartPurity.getByRole("button", { name: "14K", exact: true })).toBeVisible();
+});
+
+test("theme toggle persists between light and dark modes", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  await page.goto("/");
+  const root = page.locator("html");
+  await expect(root).toHaveAttribute("data-theme", "light");
+  const lightBackground = await root.evaluate((element) =>
+    getComputedStyle(element).getPropertyValue("--background").trim(),
+  );
+  await page.getByRole("button", { name: "Switch to dark mode" }).click();
+  await expect(root).toHaveAttribute("data-theme", "dark");
+  const darkBackground = await root.evaluate((element) =>
+    getComputedStyle(element).getPropertyValue("--background").trim(),
+  );
+  expect(darkBackground).not.toBe(lightBackground);
+  await page.reload();
+  await expect(root).toHaveAttribute("data-theme", "dark");
+  await page.getByRole("button", { name: "Switch to light mode" }).click();
+  await expect(root).toHaveAttribute("data-theme", "light");
 });

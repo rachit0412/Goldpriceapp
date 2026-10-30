@@ -16,7 +16,8 @@ import {
 import { atomic, db, get, list, put, remove } from "@/lib/store";
 import { z } from "zod";
 import { sameOrigin } from "@/lib/security";
-import { dealerQuoteSchema, dealers } from "@/lib/dealers";
+import { dealerQuoteSchema, dealers, indianHistory } from "@/lib/dealers";
+import { indianDailyHistory } from "@/lib/india-history";
 
 export const runtime = "nodejs";
 type Context = { params: Promise<{ path: string[] }> };
@@ -34,7 +35,17 @@ export async function GET(request: NextRequest, context: Context) {
       const days = Number(request.nextUrl.searchParams.get("days") || 30);
       if (![7, 30, 90, 365].includes(days))
         return json({ error: "Invalid history range" }, 400);
-      return json(await history(days));
+      const country = request.nextUrl.searchParams.get("country") || "Netherlands";
+      if (!["India", "Netherlands"].includes(country))
+        return json({ error: "Invalid history country" }, 400);
+      const source = request.nextUrl.searchParams.get("source") || "IBJA";
+      if (country === "India" && !["IBJA", "Raksha"].includes(source))
+        return json({ error: "Invalid Indian history source" }, 400);
+      return json(country === "India"
+        ? source === "Raksha"
+          ? await indianHistory(days, request.nextUrl.searchParams.get("product"))
+          : await indianDailyHistory(days)
+        : { ...await history(days), country: "Netherlands" });
     }
     if (path[0] === "fx") {
       const date = request.nextUrl.searchParams.get("date");

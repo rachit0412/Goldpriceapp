@@ -17,8 +17,9 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { convert, type Currency, type Rates } from "@/lib/finance";
-import type { DealerQuote, dealers } from "@/lib/dealers";
+import { convert, countryPurities, metalPrice, purityFraction, purityLabel, type Currency, type Rates } from "@/lib/finance";
+import type { DealerFeed, DealerQuote, dealers } from "@/lib/dealers";
+import type { StandardBullionFeed } from "@/lib/market";
 
 type DealerState = Awaited<ReturnType<typeof dealers>>;
 const price = (amount: number | null, currency: Currency) =>
@@ -33,35 +34,75 @@ const timestamp = (value: string | null) =>
   value ? new Date(value).toLocaleString() : "Not supplied";
 function InputField({
   label,
+  displayLabel,
   children,
 }: {
   label: string;
-  children: ReactElement<{ "aria-labelledby"?: string }>;
+  displayLabel?: string;
+  children: ReactElement<{ "aria-labelledby"?: string; "aria-label"?: string }>;
 }) {
   const id = useId();
   return (
     <label className="field">
-      <span id={id}>{label}</span>
-      {cloneElement(children, { "aria-labelledby": id })}
+      <span id={id}>{displayLabel || label}</span>
+      {cloneElement(children, displayLabel ? { "aria-labelledby": undefined, "aria-label": label } : { "aria-labelledby": id })}
     </label>
   );
 }
 export default function LocalMarkets({
   revision,
   rates,
-  currency,
-  changeCurrency,
+  fxObservedAt,
+  fxStale,
+  weight,
+  changeWeight,
 }: {
   revision: number;
   rates?: Rates;
-  currency: "Local" | Currency;
-  changeCurrency: (value: "Local" | Currency) => void;
+  fxObservedAt: string | null;
+  fxStale: boolean;
+  weight: number;
+  changeWeight: (grams: number) => void;
 }) {
   const [data, setData] = useState<DealerState | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(true);
   const [editing, setEditing] = useState<"India" | "Netherlands" | null>(null);
   const [version, setVersion] = useState(0);
+  const [purities, setPurities] = useState<Record<"India" | "Netherlands", number>>({ India: 24, Netherlands: 24 });
+  const [currencies, setCurrencies] = useState<Record<"India" | "Netherlands", Currency>>({
+    India: "INR",
+    Netherlands: "EUR",
+  });
+  const [preferencesReady, setPreferencesReady] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => {
+      try {
+        const saved = JSON.parse(localStorage.getItem("aurum-market-currencies") || "null");
+        if (active && saved && ["INR", "EUR"].includes(saved.India) && ["INR", "EUR"].includes(saved.Netherlands)) {
+          setCurrencies({ India: saved.India, Netherlands: saved.Netherlands });
+        }
+        const savedPurities = JSON.parse(localStorage.getItem("aurum-market-purities") || "null");
+        if (active && savedPurities) {
+          setPurities({
+            India: countryPurities.India.includes(savedPurities.India) ? savedPurities.India : 24,
+            Netherlands: countryPurities.Netherlands.includes(savedPurities.Netherlands) ? savedPurities.Netherlands : 24,
+          });
+        }
+      } catch {
+        localStorage.removeItem("aurum-market-currencies");
+      }
+      if (active) setPreferencesReady(true);
+    });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    if (preferencesReady) {
+      localStorage.setItem("aurum-market-currencies", JSON.stringify(currencies));
+      localStorage.setItem("aurum-market-purities", JSON.stringify(purities));
+    }
+  }, [currencies, purities, preferencesReady]);
   useEffect(() => {
     let active = true;
     const load = async () => {
@@ -106,23 +147,17 @@ export default function LocalMarkets({
     }
   };
   return (
-    <section className="local-markets" aria-label="Local dealer prices">
+    <section className="local-markets" aria-label="Country gold price views">
       <div className="section-heading">
         <div>
-          <h2>Local bullion & retail quotes</h2>
-          <p>Dealer products, exact fineness and declared tax treatment</p>
+          <h2>Gold prices by market view</h2>
+          <p>Choose INR or EUR independently for each market</p>
         </div>
-        <InputField label="Product quote currency">
-          <select
-            value={currency}
-            onChange={(event) =>
-              changeCurrency(event.target.value as "Local" | Currency)
-            }
-          >
-            <option>Local</option>
-            <option>INR</option>
-            <option>EUR</option>
-          </select>
+        <InputField label="Shared reference weight (g)">
+          <input type="number" min="0.001" max="1000000" step="any" value={weight} onChange={(event) => {
+            const grams = Number(event.target.value);
+            if (grams > 0 && grams <= 1000000) changeWeight(grams);
+          }} />
         </InputField>
       </div>
       {error && (
@@ -138,15 +173,27 @@ export default function LocalMarkets({
       )}
       <div className="country-grid dealer-grid">
         {(["India", "Netherlands"] as const).map((country) => {
-          const local: Currency = country === "India" ? "INR" : "EUR";
-          const displayed = currency === "Local" ? local : currency;
+          const displayed = currencies[country];
           const saved =
             data?.quotes.filter((quote) => quote.country === country) || [];
+          const standard = data?.standardBullion;
+          const sourceAmount = (inrAmount: number | null) =>
+            inrAmount === null
+              ? null
+              : displayed === "INR"
+                ? inrAmount
+                : rates
+                  ? convert(inrAmount, "INR", displayed, rates)
+                  : null;
           return (
             <section
               className="dealer-country"
               key={country}
-              aria-label={`${country} dealer prices`}
+              aria-label={
+                country === "India"
+                  ? "India dealer prices"
+                  : "Netherlands live gold reference"
+              }
             >
               <div className="country-header">
                 <div className="country-name">
@@ -160,10 +207,39 @@ export default function LocalMarkets({
                   />
                   <h2>{country}</h2>
                 </div>
-                <span className="text-badge">LOCAL DEALER</span>
+                <div className="market-card-controls">
+                  <InputField label={`${country} quote currency`} displayLabel="Currency">
+                    <select
+                      value={displayed}
+                      onChange={(event) =>
+                        setCurrencies((current) => ({
+                          ...current,
+                          [country]: event.target.value as Currency,
+                        }))
+                      }
+                    >
+                      <option value="INR">INR</option>
+                      <option value="EUR">EUR</option>
+                    </select>
+                  </InputField>
+                  <InputField label={`${country} reference purity`} displayLabel="Purity">
+                    <select value={purities[country]} onChange={(event) => setPurities((current) => ({ ...current, [country]: Number(event.target.value) }))}>
+                      {countryPurities[country].map(value => <option key={value} value={value}>{purityLabel(value)}</option>)}
+                    </select>
+                  </InputField>
+                  <span className="text-badge">
+                    {country === "India" ? "INDIAN REFERENCE" : "GLOBAL REFERENCE"}
+                  </span>
+                </div>
               </div>
               {country === "India" ? (
-                <>
+                <IndianReference feed={data?.raksha} currency={displayed} rates={rates} purity={purities.India} weight={weight} fxObservedAt={fxObservedAt} fxStale={fxStale} />
+              ) : (
+                <LiveReference feed={standard} country={country} currency={displayed} rates={rates} purity={purities[country]} weight={weight} fxObservedAt={fxObservedAt} fxStale={fxStale} />
+              )}
+              {country === "India" ? (
+                <details className="dealer-assumptions">
+                  <summary>Original Raksha dealer quotes</summary>
                   <div className="dealer-source">
                     <a
                       href="https://rakshabullion.com/liverates.html"
@@ -172,9 +248,6 @@ export default function LocalMarkets({
                     >
                       Raksha Bullion · Mumbai <ArrowUpRight size={13} />
                     </a>
-                    <span className="source-caution">
-                      Observation time unverified
-                    </span>
                   </div>
                   {data?.raksha.error && (
                     <p className="notice warning">
@@ -189,8 +262,8 @@ export default function LocalMarkets({
                       <thead>
                         <tr>
                           <th>Source product</th>
-                          <th>Source BUY</th>
-                          <th>Source SELL</th>
+                          <th>Source BUY ({displayed} / {data?.raksha.unitGrams ? `${data.raksha.unitGrams}g` : "source unit"})</th>
+                          <th>Source SELL ({displayed} / {data?.raksha.unitGrams ? `${data.raksha.unitGrams}g` : "source unit"})</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -203,14 +276,21 @@ export default function LocalMarkets({
                               </small>
                               <small>Source note: {row.sourceNote}</small>
                             </td>
-                            <td className="numeric">{price(row.buy, "INR")}</td>
                             <td className="numeric">
-                              {price(row.sell, "INR")}
-                              {data.raksha.unitGrams && row.sell && (
+                              {price(sourceAmount(row.buy), displayed)}
+                              {row.buy && data.raksha.unitGrams && sourceAmount(row.buy) !== null && (
+                                <small>
+                                  {price(sourceAmount(row.buy)! / data.raksha.unitGrams, displayed)} / g
+                                </small>
+                              )}
+                            </td>
+                            <td className="numeric">
+                              {price(sourceAmount(row.sell), displayed)}
+                              {data.raksha.unitGrams && row.sell && sourceAmount(row.sell) !== null && (
                                 <small>
                                   {price(
-                                    row.sell / data.raksha.unitGrams,
-                                    "INR",
+                                    sourceAmount(row.sell)! / data.raksha.unitGrams,
+                                    displayed,
                                   )}{" "}
                                   / g*
                                 </small>
@@ -231,14 +311,19 @@ export default function LocalMarkets({
                     <p>
                       <strong>Quote unit:</strong>{" "}
                       {data?.raksha.unitGrams
-                        ? `${data.raksha.unitGrams}g (operator-confirmed configuration). *Calculated per gram.`
-                        : "Not supplied by the feed; amounts are raw source quotes, not per gram or per 10g."}
+                        ? `Displayed as ${data.raksha.unitGrams}g source quotes by user preference; Raksha does not state the unit in its feed. Per-gram values are calculated only from that assumption.`
+                        : "Raksha does not state the price unit in its feed; amounts are raw source quotes and cannot be normalized."}
                     </p>
                     <p>
                       <strong>Provider observation:</strong> not supplied as a
                       reliable timestamp. <strong>App retrieval:</strong>{" "}
                       {timestamp(data?.raksha.retrievedAt || null)}.
                     </p>
+                    {displayed !== "INR" && (
+                      <p>
+                        Raw INR feed amounts converted to EUR using Frankfurter reference FX observed {fxObservedAt?.slice(0, 10) || "not available"}{fxStale ? " (stale)" : ""}. The configured weight unit remains an app display assumption.
+                      </p>
+                    )}
                     <p>
                       BUY / SELL and delivery labels are preserved from the
                       source. “WITH GST” means source-labelled inclusive; other
@@ -246,72 +331,8 @@ export default function LocalMarkets({
                       inferred, and these quotes never trigger alerts.
                     </p>
                   </div>
-                </>
-              ) : (
-                <>
-                  <div className="dealer-source">
-                    <a
-                      href="https://www.goldbypost.nl/goudbaren/1-ounce-goudbaren/"
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      GoldByPost · bullion products <ArrowUpRight size={13} />
-                    </a>
-                    <span className="source-caution">
-                      Automated feed unavailable
-                    </span>
-                  </div>
-                  <div className="dealer-unavailable">
-                    <h3>No verified automated retail quote</h3>
-                    <p>
-                      GoldByPost blocks direct app retrieval, and its site-use
-                      policy restricts copying. I verified the documented
-                      goldprice.dev physical API too: <code>GET
-                      /v1/physical/NL</code> returns <code>404 unknown_country</code>;
-                      NL is absent from its covered-country list. No country
-                      substitution, access-challenge bypass or scraped prices
-                      are used.
-                    </p>
-                    <p className="api-source-links">
-                      <a href="https://goldprice.dev/docs/physical" target="_blank" rel="noreferrer">Physical API coverage and schema <ArrowUpRight size={12} /></a>
-                      <a href="https://goldprice.dev/pricing" target="_blank" rel="noreferrer">Plans: dealer endpoint requires Basic ($19/month) <ArrowUpRight size={12} /></a>
-                    </p>
-                    <a
-                      className="secondary"
-                      href="https://www.goldbypost.nl/goudbaren/1-ounce-goudbaren/"
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Open 999.9 bar listings <ArrowUpRight size={14} />
-                    </a>
-                  </div>
-                  <div className="dealer-assumptions">
-                    <p>
-                      <a
-                        href="https://www.goldbypost.nl/goud-prijs/actuele-goudprijs-eur/"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        The linked EUR gold chart
-                      </a>{" "}
-                      is a spot benchmark, not a bar&apos;s checkout price. Bar
-                      premiums, quantity tiers and delivery costs differ.
-                    </p>
-                    <p>
-                      <a
-                        href="https://www.goldbypost.nl/info/geen-btw-over-beleggingsgoud/"
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Dealer VAT guidance
-                      </a>{" "}
-                      describes qualifying investment gold, not a blanket
-                      jewellery exemption. Tax treatment must be verified for
-                      the quoted product.
-                    </p>
-                  </div>
-                </>
-              )}
+                </details>
+              ) : null}
               <div className="saved-dealer-quotes">
                 <div className="section-heading">
                   <h3>Saved product quotes</h3>
@@ -431,6 +452,81 @@ export default function LocalMarkets({
       )}
     </section>
   );
+}
+function IndianReference({ feed, currency, rates, purity, weight, fxObservedAt, fxStale }: {
+  feed?: DealerFeed;
+  currency: Currency;
+  rates?: Rates;
+  purity: number;
+  weight: number;
+  fxObservedAt: string | null;
+  fxStale: boolean;
+}) {
+  const rows = feed?.rows || [];
+  const matching = rows.filter(row => row.fineness === (purity === 995 ? 995 : 999));
+  const product = matching.find(row => row.gst === "Not stated")
+    || matching[0]
+    || rows.find(row => row.fineness === 999)
+    || rows[0];
+  const converted = (amount: number | null, grams = 1) => {
+    if (amount === null || !product || !feed?.unitGrams) return null;
+    const inr = amount * grams / feed.unitGrams * purityFraction(purity) / (product.fineness / 1000);
+    return currency === "INR" ? inr : rates ? convert(inr, "INR", currency, rates) : null;
+  };
+  return (
+    <section className="indian-reference" aria-label="India Raksha price reference">
+      <div className="dealer-source">
+        <a href="https://rakshabullion.com/liverates.html" target="_blank" rel="noreferrer">Raksha Bullion · Mumbai <ArrowUpRight size={13} /></a>
+        <span className="source-caution">{!feed ? "Loading Indian reference" : feed.error ? "Stale / unavailable" : `Auto-refresh · fetched ${timestamp(feed.retrievedAt)}`}</span>
+      </div>
+      {product ? (
+        <>
+          <div className="spot-quote-grid">
+            <div className="spot-quote-value"><span>Raksha source BUY · {currency} / g</span><strong>{price(converted(product.buy), currency)}</strong><small>per 1g · {purityLabel(purity)} estimate</small><small>{price(converted(product.buy, weight), currency)} total for {weight}g</small></div>
+            <div className="spot-quote-value"><span>Raksha source SELL · {currency} / g</span><strong>{price(converted(product.sell), currency)}</strong><small>per 1g · {purityLabel(purity)} estimate</small><small>{price(converted(product.sell, weight), currency)} total for {weight}g</small></div>
+          </div>
+          <div className="dealer-assumptions">
+            <p>Based on {product.label} ({product.fineness} fine). GST: {product.gst}. No additional tax added. Source note: {product.sourceNote}.</p>
+            <p>Calculated from this Indian dealer quote using the selected purity and weight; not a directly quoted jewellery price. {feed?.unitGrams ? `Source weight assumed ${feed.unitGrams}g; not verified by Raksha.` : "Source weight is unknown; normalized reference unavailable."}</p>
+            <p>Provider observation: not supplied as a reliable timestamp. App retrieval: {timestamp(feed?.retrievedAt || null)}.{feed?.error ? ` Cached quote is stale: ${feed.error}.` : ""}</p>
+            {currency !== "INR" && <p>INR converted using Frankfurter daily FX observed {fxObservedAt?.slice(0, 10) || "unavailable"}{fxStale ? " (stale)" : ""}.</p>}
+          </div>
+        </>
+      ) : <p className="dealer-empty">{feed ? "Indian reference unavailable. No global-price substitution." : "Loading Indian dealer reference."}</p>}
+    </section>
+  );
+}
+function LiveReference({ feed, country, currency, rates, purity, weight, fxObservedAt, fxStale }: {
+  feed?: StandardBullionFeed;
+  country: "India" | "Netherlands";
+  currency: Currency;
+  rates?: Rates;
+  purity: number;
+  weight: number;
+  fxObservedAt: string | null;
+  fxStale: boolean;
+}) {
+  const quote = feed?.value;
+  const converted = (amount: number, grams = 1) => rates ? metalPrice(amount, purity, grams, currency, rates) : null;
+  const status = !feed ? "Loading reference" : !quote || !rates ? "Reference unavailable" : feed.stale || fxStale ? "Stale reference" : "Live reference";
+  return <section className="live-reference" aria-label={`${country} global spot reference`}>
+    <div className="dealer-source">
+      <a href="https://standardbullion.com/spot-gold-price" target="_blank" rel="noreferrer">Standard Bullion · global gold quote <ArrowUpRight size={13} /></a>
+      <span className="source-caution">{status}</span>
+    </div>
+    {feed?.error && <p className="notice warning">{feed.error}. {quote ? "Cached reference is stale." : "No current quote available."}</p>}
+    {quote ? <>
+      <div className="spot-quote-grid">
+        <div className="spot-quote-value"><span>Source ask · buy · {currency} / g</span><strong>{price(converted(quote.gold.ask), currency)}</strong><small>per 1g · {purityLabel(purity)} equivalent</small><small>{price(converted(quote.gold.ask, weight), currency)} total for {weight}g</small></div>
+        <div className="spot-quote-value"><span>Source bid · sell to source · {currency} / g</span><strong>{price(converted(quote.gold.bid), currency)}</strong><small>per 1g · {purityLabel(purity)} equivalent</small><small>{price(converted(quote.gold.bid, weight), currency)} total for {weight}g</small></div>
+      </div>
+      <div className="dealer-assumptions">
+        <p><strong>Provider observation:</strong> {timestamp(quote.updated)}. <strong>App retrieval:</strong> {timestamp(feed.retrievedAt)}.</p>
+        <p>Calculated purity-adjusted reference from {quote.unit}. Frankfurter daily FX observed {fxObservedAt?.slice(0, 10) || "unavailable"}{fxStale ? " (stale)" : ""}. No GST, VAT, product premium or making charge added. This is not a {country}-specific product price or local dealer offer.</p>
+        <p>{quote.disclaimer} <a href="https://standardbullion.com" target="_blank" rel="noreferrer">{quote.attribution}</a></p>
+      </div>
+    </> : <p className="dealer-empty">{feed ? "Global reference unavailable. No sample prices are used." : "Loading global reference."}</p>}
+  </section>;
 }
 function QuoteForm({
   country,

@@ -33,11 +33,13 @@ import {
   Gem,
   LayoutDashboard,
   LoaderCircle,
+  Moon,
   Pencil,
   Plus,
   RefreshCw,
   Settings2,
   ShieldCheck,
+  Sun,
   Trash2,
   Upload,
   Wallet,
@@ -84,9 +86,11 @@ type State = {
   };
 };
 type History = Cached<HistoryPoint[]> & {
-  authenticated: boolean;
   method: string;
   stale: boolean;
+  country?: "India" | "Netherlands";
+  grain?: "daily";
+  sourceUrl?: string;
 };
 type Preferences = {
   currency: "Local" | Currency;
@@ -94,13 +98,15 @@ type Preferences = {
   weight: number;
   days: number;
   base: Currency;
+  chartCountry: "India" | "Netherlands";
 };
 const defaults: Preferences = {
   currency: "Local",
   purity: 24,
   weight: 10,
-  days: 30,
+  days: 7,
   base: "EUR",
+  chartCountry: "Netherlands",
 };
 const icons = {
   Dashboard: LayoutDashboard,
@@ -190,6 +196,8 @@ function Segments<T extends string | number>({
 export default function GoldTracker() {
   const [view, setView] = useState<View>("Dashboard");
   const [preferences, setPreferences] = useState<Preferences>(defaults);
+  const [theme, setTheme] = useState<"light" | "dark">("light");
+  const [themeReady, setThemeReady] = useState(false);
   const [ready, setReady] = useState(false);
   const [data, setData] = useState<State | null>(null);
   const [history, setHistory] = useState<History | null>(null);
@@ -207,13 +215,19 @@ export default function GoldTracker() {
         if (
           saved &&
           ["Local", "EUR", "INR"].includes(saved.currency) &&
-          [18, 22, 24].includes(saved.purity) &&
+          [14, 18, 22, 24].includes(saved.purity) &&
           [7, 30, 90, 365].includes(saved.days) &&
           ["EUR", "INR"].includes(saved.base) &&
           saved.weight > 0 &&
           saved.weight <= 1000000
-        )
-          setPreferences(saved);
+        ) {
+          setPreferences({
+            ...saved,
+            days: saved.version === 2 ? saved.days : 7,
+            chartCountry: saved.chartCountry === "India" ? "India" : "Netherlands",
+            purity: saved.purity === 14 && saved.chartCountry === "India" ? 24 : saved.purity,
+          });
+        }
       } catch {
         localStorage.removeItem("aurum-preferences");
       }
@@ -222,8 +236,36 @@ export default function GoldTracker() {
   }, []);
   useEffect(() => {
     if (ready)
-      localStorage.setItem("aurum-preferences", JSON.stringify(preferences));
+      localStorage.setItem(
+        "aurum-preferences",
+        JSON.stringify({ ...preferences, version: 2 }),
+      );
   }, [preferences, ready]);
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => {
+      const saved = localStorage.getItem("aurum-theme");
+      const selected =
+        saved === "dark" || saved === "light"
+          ? saved
+          : window.matchMedia("(prefers-color-scheme: dark)").matches
+            ? "dark"
+            : "light";
+      if (active) {
+        setTheme(selected);
+        document.documentElement.dataset.theme = selected;
+        setThemeReady(true);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (!themeReady) return;
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("aurum-theme", theme);
+  }, [theme, themeReady]);
   useEffect(() => {
     if (!ready) return;
     let active = true;
@@ -254,11 +296,11 @@ export default function GoldTracker() {
   useEffect(() => {
     if (!ready) return;
     let active = true;
-    const load = async () => {
-      setChartBusy(true);
+    const load = async (background = false) => {
+      if (!background) setChartBusy(true);
       try {
         const result = await api<History>(
-          `/api/history?days=${preferences.days}`,
+          `/api/history?days=${preferences.days}&country=${preferences.chartCountry}`,
         );
         if (active) setHistory(result);
       } catch (failure) {
@@ -275,17 +317,23 @@ export default function GoldTracker() {
             source: "History",
             method: "Unavailable",
             stale: true,
-            authenticated: false,
           });
       } finally {
         if (active) setChartBusy(false);
       }
     };
     void load();
+    const timer = setInterval(() => void load(true), 60000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void load(true);
+    };
+    document.addEventListener("visibilitychange", onVisible);
     return () => {
       active = false;
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [ready, preferences.days, revision]);
+  }, [ready, preferences.days, preferences.chartCountry, revision]);
   useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(""), 5000);
@@ -368,6 +416,16 @@ export default function GoldTracker() {
             <strong>{view}</strong>
           </div>
           <div className="topbar-right">
+            <button
+              className="icon-button theme-toggle"
+              type="button"
+              title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+              aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+              aria-pressed={theme === "dark"}
+              onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}
+            >
+              {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
             <span className={`status ${fresh ? "fresh" : ""}`}>
               <i />
               {busy && !data
@@ -388,7 +446,7 @@ export default function GoldTracker() {
               <h1>{title}</h1>
               <p>
                 {view === "Dashboard"
-                  ? "Local dealer quotes and international spot are different price types."
+                  ? "India dealer rates and a live EUR gold reference for the Netherlands view."
                   : view === "Compare"
                     ? "Normalized quotes, with every assumption in view."
                     : view === "Portfolio"
@@ -429,8 +487,10 @@ export default function GoldTracker() {
               <LocalMarkets
                 revision={revision}
                 rates={rates}
-                currency={preferences.currency}
-                changeCurrency={(value) => change({ currency: value })}
+                fxObservedAt={data?.market.fx.observedAt || null}
+                fxStale={data?.market.fx.stale ?? true}
+                weight={preferences.weight}
+                changeWeight={(weight) => change({ weight })}
               />
               <details className="benchmark-section">
                 <summary>
@@ -538,7 +598,7 @@ export default function GoldTracker() {
                           <span>
                             {daily === null
                               ? "Needs a prior daily observation"
-                              : `vs ${previous!.date} ${history?.authenticated ? "daily average" : "collected observation"}`}
+                              : `vs ${new Date(previous!.date).toLocaleString()} Standard Bullion observation`}
                           </span>
                         </div>
                         <div className="country-total">
@@ -623,38 +683,61 @@ export default function GoldTracker() {
                 <section className="chart-section">
                   <div className="section-heading">
                     <div>
-                      <h2>Price history</h2>
+                      <h2>{preferences.chartCountry} gold price · last {preferences.days} {preferences.chartCountry === "India" ? "published days" : "days"}</h2>
                       <p>
-                        {preferences.purity}K ·{" "}
+                        {purityLabel(preferences.purity)} ·{" "}
                         {preferences.currency === "Local"
-                          ? "INR"
+                          ? preferences.chartCountry === "India" ? "INR" : "EUR"
                           : preferences.currency}{" "}
-                        per gram · historical FX
+                        per gram · historical FX{preferences.chartCountry === "India" ? " · IBJA daily PM benchmark" : " · global reference"}
                       </p>
                     </div>
-                    <Segments
-                      label="History range"
-                      value={preferences.days}
-                      onChange={(value) => change({ days: value })}
-                      values={[
-                        { value: 7, label: "7D" },
-                        { value: 30, label: "30D" },
-                        { value: 90, label: "90D" },
-                        { value: 365, label: "1Y" },
-                      ]}
-                    />
+                    <div className="chart-controls">
+                      <Segments
+                        label="Chart country"
+                        value={preferences.chartCountry}
+                        onChange={(chartCountry) => change({ chartCountry, purity: chartCountry === "India" && preferences.purity === 14 ? 24 : preferences.purity })}
+                        values={[{ value: "India", label: "India" }, { value: "Netherlands", label: "Netherlands" }]}
+                      />
+                      <Segments
+                        label="Chart currency"
+                        value={preferences.currency === "Local" ? preferences.chartCountry === "India" ? "INR" : "EUR" : preferences.currency}
+                        onChange={(currency) => change({ currency })}
+                        values={[{ value: "INR", label: "INR" }, { value: "EUR", label: "EUR" }]}
+                      />
+                      <Segments
+                        label="Chart purity"
+                        value={preferences.purity}
+                        onChange={(value) => change({ purity: value })}
+                        values={(preferences.chartCountry === "India" ? [24, 22, 18] : [24, 22, 18, 14]).map((value) => ({
+                          value,
+                          label: `${value}K`,
+                        }))}
+                      />
+                      <Segments
+                        label="History range"
+                        value={preferences.days}
+                        onChange={(value) => change({ days: value })}
+                        values={[
+                          { value: 7, label: "7D" },
+                          { value: 30, label: "30D" },
+                          { value: 90, label: "90D" },
+                          { value: 365, label: "1Y" },
+                        ]}
+                      />
+                    </div>
                   </div>
                   {chartBusy ? (
                     <div className="chart-placeholder" role="status">
                       <LoaderCircle className="spin" size={22} />
                       Loading observations
                     </div>
-                  ) : (history?.value?.length || 0) < 2 ? (
+                  ) : !(history?.value?.length) ? (
                     <Empty title="History is still taking shape">
                       {history?.error ||
-                        (history?.authenticated
-                          ? "The provider has fewer than two observations in this range."
-                          : "Add a history API key in server settings for backfill. Fresh daily observations are collected automatically.")}
+                        (preferences.chartCountry === "India"
+                          ? "Published Indian daily history is unavailable from IBJA. No global or invented prices are substituted."
+                          : "No provider observations in this range. No sample prices are shown.")}
                     </Empty>
                   ) : (
                     <HistoryChart
@@ -662,16 +745,19 @@ export default function GoldTracker() {
                       purity={preferences.purity}
                       currency={
                         preferences.currency === "Local"
-                          ? "INR"
+                          ? preferences.chartCountry === "India" ? "INR" : "EUR"
                           : preferences.currency
                       }
                     />
                   )}
                   <div className="history-caption">
+                    <span>Auto-refresh: every 60 seconds. Latest retrieval: {time(history?.retrievedAt)}. </span>
+                    {history?.value?.length === 1 && <span>One collected observation; no trend yet. </span>}
                     {history?.stale && (
                       <span className="negative">Stale history. </span>
                     )}
                     {history?.method || "No history yet"}
+                    {history?.sourceUrl && <> <a href={history.sourceUrl} target="_blank" rel="noreferrer">Published source</a></>}
                     {history?.error && ` · ${history.error}`}
                   </div>
                 </section>
@@ -792,38 +878,58 @@ function HistoryChart({
   purity: number;
   currency: Currency;
 }) {
+  const observationTime = (value: string | number) =>
+    new Date(typeof value === "number" ? value : value.length === 10 ? `${value}T00:00:00Z` : value);
   const points = history.value!.map((point) => ({
     ...point,
+    timestamp: observationTime(point.date).getTime(),
     value: ((point[currency] / TROY_OUNCE) * purity) / 24,
   }));
+  const first = points[0];
+  const latest = points.at(-1)!;
+  const [tableDetail, setTableDetail] = useState<"Daily" | "All observations">("Daily");
+  const dailyPoints = [...new Map(points.map(point => [point.date.slice(0, 10), point])).values()];
+  const tablePoints = tableDetail === "Daily" ? dailyPoints : points;
+  const dayTicks = [...new Set(points.map(point => point.date.slice(0, 10)))].map(date => Date.parse(`${date}T00:00:00Z`)).filter(tick => tick >= first.timestamp && tick <= latest.timestamp);
+  const ticks = dayTicks.length ? dayTicks : [...new Set([first.timestamp, latest.timestamp])];
+  const rangeChange = latest.value - first.value;
   return (
     <>
+      <div className="history-summary" aria-label="Selected range price change">
+        <Metric label="First observation / g" value={money(first.value, currency)} />
+        <Metric label="Latest observation / g" value={money(latest.value, currency)} />
+        <Metric label="Change from first observation" value={points.length > 1 ? `${money(rangeChange, currency)} (${signed(rangeChange / first.value * 100)})` : "Needs two observations"} className={points.length === 1 ? undefined : rangeChange < 0 ? "negative" : "positive"} />
+      </div>
       <div
         className="chart"
         role="img"
-        aria-label={`${purity}K gold daily history in ${currency} per gram. Data table below.`}
+        aria-label={`${purityLabel(purity)} gold observations over the selected range in ${currency} per gram. Data table below.`}
       >
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart
             data={points}
-            margin={{ left: 10, right: 12, top: 20, bottom: 8 }}
+            margin={{ left: 10, right: 28, top: 20, bottom: 8 }}
             accessibilityLayer
           >
             <defs>
               <linearGradient id="gold-fill" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor="#b28a30" stopOpacity={0.19} />
-                <stop offset="100%" stopColor="#b28a30" stopOpacity={0.01} />
+                <stop offset="0%" stopColor="var(--chart-fill)" stopOpacity={0.22} />
+                <stop offset="100%" stopColor="var(--chart-fill)" stopOpacity={0.01} />
               </linearGradient>
             </defs>
             <CartesianGrid
               vertical={false}
-              stroke="#e9e9e7"
+              stroke="var(--line)"
               strokeDasharray="3 5"
             />
             <XAxis
-              dataKey="date"
+              dataKey="timestamp"
+              type="number"
+              scale="time"
+              domain={points.length === 1 ? [first.timestamp - 1800000, first.timestamp + 1800000] : ["dataMin", "dataMax"]}
+              ticks={ticks}
               tickFormatter={(value) =>
-                new Date(`${value}T00:00:00Z`).toLocaleDateString("en", {
+                observationTime(Number(value)).toLocaleDateString("en", {
                   month: "short",
                   day: "numeric",
                   timeZone: "UTC",
@@ -832,7 +938,7 @@ function HistoryChart({
               tickLine={false}
               axisLine={false}
               minTickGap={32}
-              tick={{ fontSize: 11 }}
+              tick={{ fontSize: 11, fill: "var(--subtle)" }}
             />
             <YAxis
               domain={["auto", "auto"]}
@@ -840,43 +946,50 @@ function HistoryChart({
               width={65}
               tickLine={false}
               axisLine={false}
-              tick={{ fontSize: 11 }}
+              tick={{ fontSize: 11, fill: "var(--subtle)" }}
             />
             <Tooltip
               formatter={(value) => [
                 money(Number(value), currency),
                 `${purity}K / gram`,
               ]}
-              labelFormatter={(value) => `UTC date: ${value}`}
-              contentStyle={{ borderRadius: 4, borderColor: "#ddd" }}
+              labelFormatter={(value) =>
+                history.grain === "daily"
+                  ? `Published day: ${observationTime(Number(value)).toLocaleDateString("en", { timeZone: "UTC", dateStyle: "medium" })}`
+                  : `${history.country === "India" ? "App retrieval" : "Observed"}: ${observationTime(Number(value)).toLocaleString("en", { timeZone: "UTC", dateStyle: "medium", timeStyle: "short" })} UTC`
+              }
+              contentStyle={{ borderRadius: 4, borderColor: "var(--line)", backgroundColor: "var(--surface)", color: "var(--ink)" }}
             />
             <Area
               type="linear"
               dataKey="value"
-              stroke="#aa8125"
+              stroke="var(--chart-line)"
               strokeWidth={2}
               fill="url(#gold-fill)"
               isAnimationActive={false}
               connectNulls={false}
+              dot={points.length === 1 ? { r: 4, fill: "var(--chart-line)" } : false}
             />
           </AreaChart>
         </ResponsiveContainer>
       </div>
       <details className="chart-table">
-        <summary>View observations ({points.length})</summary>
+        <summary>View observations ({tablePoints.length})</summary>
+        <Segments label="Observation table detail" value={tableDetail} onChange={setTableDetail} values={[{ value: "Daily", label: "Daily" }, { value: "All observations", label: "All observations" }]} />
+        <p>{history.grain === "daily" ? "Published Indian PM benchmarks. Dates without a publication are omitted, not filled with invented prices." : "Daily rows retain the last real observation for each UTC date. Unchanged source prices are preserved."}</p>
         <div className="table-scroll history-table">
           <table>
             <thead>
               <tr>
-                <th>Gold date (UTC)</th>
+                <th>{history.grain === "daily" ? "Publication date (India)" : history.country === "India" ? "App retrieval (UTC)" : "Gold observation (UTC)"}</th>
                 <th>{currency}/g</th>
                 <th>FX observation date</th>
               </tr>
             </thead>
             <tbody>
-              {points.map((point) => (
+              {tablePoints.map((point) => (
                 <tr key={point.date}>
-                  <td>{point.date}</td>
+                  <td>{history.grain === "daily" ? observationTime(point.date).toLocaleDateString("en", { timeZone: "UTC", dateStyle: "medium" }) : observationTime(point.date).toLocaleString("en", { timeZone: "UTC", dateStyle: "medium", timeStyle: "short" })}</td>
                   <td>{money(point.value, currency)}</td>
                   <td>{point.fxDate}</td>
                 </tr>

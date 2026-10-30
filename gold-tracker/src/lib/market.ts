@@ -38,6 +38,29 @@ const fxSchema = z.array(
 const historySchema = z.array(
   z.object({ day: z.iso.date(), avg_price: z.number().positive() }),
 );
+const standardHistorySchema = z.object({
+  source: z.literal("Standard Bullion"),
+  unit: z.literal("USD per troy ounce"),
+  grain: z.string().min(1),
+  points: z.array(z.object({ t: z.iso.datetime(), price: z.number().positive() })),
+});
+const standardBullionSchema = z.object({
+  source: z.literal("Standard Bullion"),
+  url: z.url(),
+  unit: z.literal("USD per troy ounce"),
+  updated: z.iso.datetime(),
+  attribution: z.string().min(1),
+  disclaimer: z.string().min(1),
+  metals: z.array(z.object({
+    symbol: z.string(),
+    page: z.url(),
+    ask: z.number().positive(),
+    bid: z.number().positive(),
+    open: z.number().positive(),
+    changeToday: z.object({ amount: z.number(), percent: z.number() }),
+    changes: z.object({ "1w": z.number(), "1m": z.number(), "1y": z.number() }),
+  })).min(1),
+});
 const inFlight = new Map<string, Promise<unknown>>();
 export async function fetchJson(url: string, headers?: Record<string, string>) {
   if (url.startsWith("https://api.gold-api.com/history")) {
@@ -60,7 +83,46 @@ export async function fetchJson(url: string, headers?: Record<string, string>) {
     throw new Error(`Provider returned HTTP ${response.status}`);
   return response.json() as Promise<unknown>;
 }
-async function cached<T>(
+export type StandardBullionQuote = {
+  source: string;
+  url: string;
+  unit: "USD per troy ounce";
+  updated: string;
+  attribution: string;
+  disclaimer: string;
+  gold: {
+    symbol: "XAU";
+    ask: number;
+    bid: number;
+    open: number;
+    changeToday: { amount: number; percent: number };
+    changes: { "1w": number; "1m": number; "1y": number };
+    page: string;
+  };
+};
+export type StandardBullionFeed = Cached<StandardBullionQuote> & { stale: boolean };
+export function parseStandardBullion(raw: unknown): StandardBullionQuote {
+  const feed = standardBullionSchema.parse(raw);
+  const gold = feed.metals.find((metal) => metal.symbol === "XAU");
+  if (!gold) throw new Error("Standard Bullion response has no XAU quote");
+  if (gold.bid > gold.ask) throw new Error("Standard Bullion bid exceeds ask");
+  return { ...feed, gold: { ...gold, symbol: "XAU" } };
+}
+export async function standardBullion(): Promise<StandardBullionFeed> {
+  const entry = await cached<StandardBullionQuote>(
+    "standard-bullion-spot",
+    "Standard Bullion · live USD dealer bid/ask",
+    30,
+    async () => {
+      const quote = parseStandardBullion(
+        await fetchJson("https://standardbullion.com/spot-prices.json"),
+      );
+      return { value: quote, observedAt: quote.updated };
+    },
+  );
+  return { ...entry, stale: stale(entry, Math.min(config.staleSeconds, 120)) };
+}
+export async function cached<T>(
   key: string,
   source: string,
   ttl: number,
@@ -195,6 +257,55 @@ export type HistoryPoint = {
   INR: number;
   fxDate: string;
 };
+export type StandardHistoryPrice = { t: string; price: number };
+export function normalizeStandardHistory(
+  prices: StandardHistoryPrice[],
+  fxRaw: unknown,
+  fromTime: number,
+  toTime: number,
+  liveMid?: StandardHistoryPrice,
+): HistoryPoint[] {
+  const candidates = prices.filter((point) => {
+    const observed = Date.parse(point.t);
+    return Number.isFinite(observed) && observed >= fromTime && observed <= toTime;
+  });
+  if (
+    liveMid &&
+    Date.parse(liveMid.t) >= fromTime &&
+    Date.parse(liveMid.t) <= toTime
+  ) {
+    const last = candidates.reduce<StandardHistoryPrice | null>(
+      (latest, point) =>
+        !latest || Date.parse(point.t) > Date.parse(latest.t) ? point : latest,
+      null,
+    );
+    if (!last || Date.parse(liveMid.t) > Date.parse(last.t))
+      candidates.push(liveMid);
+  }
+  candidates.sort((first, second) => Date.parse(first.t) - Date.parse(second.t));
+  const fx = fxSchema.parse(fxRaw);
+  const output: HistoryPoint[] = [];
+  for (const point of candidates) {
+    const date = point.t.slice(0, 10);
+    const eligible = fx
+      .filter((row) => row.date <= date)
+      .sort((first, second) => second.date.localeCompare(first.date));
+    const eur = eligible.find((row) => row.quote === "EUR");
+    const inr = eligible.find((row) => row.quote === "INR");
+    if (!eur || !inr || eur.date !== inr.date) continue;
+    const fxAge =
+      Date.parse(`${date}T00:00:00Z`) - Date.parse(`${eur.date}T00:00:00Z`);
+    if (fxAge < 0 || fxAge > 7 * 86400000) continue;
+    output.push({
+      date: point.t,
+      usd: point.price,
+      EUR: point.price * eur.rate,
+      INR: point.price * inr.rate,
+      fxDate: eur.date,
+    });
+  }
+  return output;
+}
 export async function historicalGold(
   date: string,
 ): Promise<{ price: number; date: string; method: string } | null> {
@@ -241,78 +352,67 @@ export async function historicalGold(
   return entry.value;
 }
 export async function history(days: number) {
-  await market();
-  const to = new Date().toISOString().slice(0, 10);
-  const start = new Date(`${to}T00:00:00Z`);
-  start.setUTCDate(start.getUTCDate() - days + 1);
-  const from = start.toISOString().slice(0, 10);
+  const ranges: Record<number, string> = {
+    7: "7d",
+    30: "1m",
+    90: "3m",
+    365: "1y",
+  };
+  const range = ranges[days];
+  if (!range) throw new Error("Unsupported history range");
+  const now = Date.now();
+  const fromTime = Date.parse(`${new Date(now).toISOString().slice(0, 10)}T00:00:00Z`) - (days - 1) * 86400000;
+  const from = new Date(fromTime).toISOString().slice(0, 10);
+  const to = new Date(now).toISOString().slice(0, 10);
+  const fxStart = new Date(`${from}T00:00:00Z`);
+  fxStart.setUTCDate(fxStart.getUTCDate() - 7);
   const entry = await cached<HistoryPoint[]>(
-    `history-${process.env.GOLD_API_KEY ? "api" : "collected"}-${days}-${to}`,
-    "gold-api.com daily average + Frankfurter historical FX",
-    21600,
+    `standard-history-calendar-${days}-${to}`,
+    "Standard Bullion captured XAU history + Frankfurter historical FX",
+    60,
     async () => {
-      const { list } = await import("./store");
-      let prices = list<{ date: string; price: number }>("observations").filter(
-        (row) => row.date >= from && row.date <= to,
-      );
-      if (process.env.GOLD_API_KEY) {
-        const url = `https://api.gold-api.com/history?symbol=XAU&startTimestamp=${Math.floor(start.getTime() / 1000)}&endTimestamp=${Math.floor(Date.now() / 1000)}&groupBy=day&aggregation=avg&orderBy=asc`;
-        prices = historySchema
-          .parse(
-            await fetchJson(url, { "x-api-key": process.env.GOLD_API_KEY }),
-          )
-          .map((row) => ({ date: row.day, price: row.avg_price }));
-      }
-      prices = prices.filter((row) => row.date >= from && row.date <= to);
-      if (!prices.length)
-        return { value: [], observedAt: new Date().toISOString() };
-      const fxStart = new Date(start);
-      fxStart.setUTCDate(fxStart.getUTCDate() - 7);
-      const fx = fxSchema.parse(
-        await fetchJson(
+      const [rawHistory, current, fxRaw] = await Promise.all([
+        fetchJson(
+          `https://standardbullion.com/api/v1/market/history?metal=XAU&range=${range}`,
+        ),
+          standardBullion(),
+        fetchJson(
           `https://api.frankfurter.dev/v2/rates?base=USD&quotes=EUR,INR&from=${fxStart.toISOString().slice(0, 10)}&to=${to}`,
         ),
+      ]);
+      const source = standardHistorySchema.parse(rawHistory);
+      const points = normalizeStandardHistory(
+        source.points,
+        fxRaw,
+        fromTime,
+        now,
+        current.value && !current.stale
+          ? {
+              t: current.value.updated,
+              price:
+                (current.value.gold.ask + current.value.gold.bid) / 2,
+            }
+          : undefined,
       );
-      const points: HistoryPoint[] = [];
-      for (const price of prices.sort((first, second) =>
-        first.date.localeCompare(second.date),
-      )) {
-        const observations = fx
-          .filter((row) => row.date <= price.date)
-          .sort((first, second) => second.date.localeCompare(first.date));
-        const eur = observations.find((row) => row.quote === "EUR");
-        const inr = observations.find((row) => row.quote === "INR");
-        if (
-          eur &&
-          inr &&
-          Date.parse(price.date) - Date.parse(eur.date) <= 7 * 86400000 &&
-          eur.date === inr.date
-        )
-          points.push({
-            date: price.date,
-            usd: price.price,
-            EUR: price.price * eur.rate,
-            INR: price.price * inr.rate,
-            fxDate: eur.date,
-          });
-      }
-      return {
-        value: points,
-        observedAt: points.length
-          ? `${points.at(-1)!.date}T00:00:00Z`
-          : new Date().toISOString(),
-      };
+      if (!points.length)
+        throw new Error("No gold observations have matching historical FX in this range");
+      return { value: points, observedAt: points.at(-1)!.date };
     },
   );
+  const staleHistory =
+    !!entry.error ||
+    !entry.value?.length ||
+    !entry.retrievedAt ||
+    !entry.observedAt ||
+    isStale(
+      entry.observedAt,
+      entry.retrievedAt,
+      Math.min(config.staleSeconds, 3600) * 1000,
+    );
   return {
     ...entry,
-    authenticated: !!process.env.GOLD_API_KEY,
-    method: process.env.GOLD_API_KEY
-      ? "Daily average (not closing price)"
-      : "Last fresh observation collected each UTC day; no backfill without GOLD_API_KEY",
-    stale:
-      !!entry.error ||
-      !entry.retrievedAt ||
-      Date.now() - Date.parse(entry.retrievedAt) > 86400000,
+    method:
+      "Standard Bullion captured XAU history; live bid/ask midpoint appended when newer. Frankfurter dated daily FX.",
+    stale: staleHistory,
   };
 }

@@ -4,7 +4,11 @@ export const TROY_OUNCE = 31.1034768;
 export type Currency = "INR" | "EUR";
 export type Rates = { INR: number; EUR: number; USD: number };
 export const currencySchema = z.enum(["INR", "EUR"]);
-export const purityValues = [24, 22, 18, 995, 999, 999.9];
+export const purityValues = [24, 22, 18, 14, 995, 999, 999.9];
+export const countryPurities = {
+  India: [24, 22, 18, 995, 999, 999.9],
+  Netherlands: [24, 22, 18, 14],
+};
 const puritySchema = z.coerce
   .number()
   .refine((value) => purityValues.includes(value));
