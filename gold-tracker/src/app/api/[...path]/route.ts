@@ -18,6 +18,9 @@ import { z } from "zod";
 import { sameOrigin } from "@/lib/security";
 import { dealerQuoteSchema, dealers, indianHistory } from "@/lib/dealers";
 import { indianDailyHistory } from "@/lib/india-history";
+import { buildForecast, descriptiveStats, type DailyObservation } from "@/lib/forecast";
+import { TROY_OUNCE } from "@/lib/finance";
+import type { HistoryPoint } from "@/lib/market";
 
 export const runtime = "nodejs";
 type Context = { params: Promise<{ path: string[] }> };
@@ -46,6 +49,32 @@ export async function GET(request: NextRequest, context: Context) {
           ? await indianHistory(days, request.nextUrl.searchParams.get("product"))
           : await indianDailyHistory(days)
         : { ...await history(days), country: "Netherlands" });
+    }
+    if (path[0] === "forecast") {
+      const country = request.nextUrl.searchParams.get("country") || "Netherlands";
+      if (!["India", "Netherlands"].includes(country))
+        return json({ error: "Invalid forecast country" }, 400);
+      const currency = request.nextUrl.searchParams.get("currency") === "INR" ? "INR" : "EUR";
+      const lookbackDays = Number(request.nextUrl.searchParams.get("days") || 30);
+      if (![30, 90, 365].includes(lookbackDays))
+        return json({ error: "Invalid forecast lookback range" }, 400);
+      const horizonDays = 7;
+      const source: { value: HistoryPoint[] | null; stale: boolean; error: string | null; method: string } =
+        country === "India" ? await indianDailyHistory(lookbackDays) : await history(lookbackDays);
+      const daily = new Map<string, DailyObservation>();
+      for (const point of source.value || [])
+        daily.set(point.date.slice(0, 10), { date: point.date.slice(0, 10), value: point[currency] / TROY_OUNCE });
+      const sortedHistory = [...daily.values()].sort((first, second) => first.date.localeCompare(second.date));
+      const forecast = buildForecast(sortedHistory, horizonDays);
+      return json({
+        country, currency, grain: "24K-equivalent pure gold, per gram",
+        lookbackDays, horizonDays, stale: source.stale,
+        sourceError: source.error, sourceMethod: source.method,
+        history: sortedHistory,
+        stats: sortedHistory.length ? descriptiveStats(sortedHistory.map((point) => point.value)) : null,
+        ...forecast,
+        method: "Ordinary least squares linear regression over real daily observations already shown in the price chart, used only to estimate a daily trend (slope). The projection then drifts forward from the latest real price by that slope, so it starts exactly at today's price. Confidence band assumes normally distributed residuals around the fitted trend line; it is a simplification, not a guarantee. This is a statistical projection, not financial advice, and does not account for news, policy or demand shocks.",
+      });
     }
     if (path[0] === "fx") {
       const date = request.nextUrl.searchParams.get("date");

@@ -63,7 +63,10 @@ test("live desktop dashboard, purity conversion, weight and preferences", async 
       .getByRole("button", { name: "22K", exact: true }),
   ).toHaveAttribute("aria-pressed", "true");
   await expect(
-    page.getByText("No forecast model", { exact: true }),
+    page.getByRole("button", { name: "Outlook", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Estimator", exact: true }),
   ).toBeVisible();
   await expect
     .poll(() =>
@@ -220,6 +223,99 @@ test("stale provider state is clearly labelled", async ({ page }) => {
   );
 });
 
+test("price outlook shows a real statistical projection, not a fake AI forecast", async ({
+  page,
+  request,
+}) => {
+  const liveResponse = await request.get("/api/forecast?country=Netherlands&currency=EUR&days=90");
+  expect(liveResponse.ok()).toBe(true);
+  const live = await liveResponse.json();
+  expect(live.method).toContain("Ordinary least squares");
+  expect(live.method).toContain("not financial advice");
+  expect(["Bullish", "Bearish", "Neutral", null]).toContain(live.direction);
+  await page.route("**/api/forecast**", async (route) => {
+    const url = new URL(route.request().url());
+    await route.fulfill({ json: {
+      country: url.searchParams.get("country"), currency: url.searchParams.get("currency"),
+      horizonDays: 7, stale: false, error: null, sourceError: null,
+      regression: { rSquared: 0.42, slope: 1, intercept: 90, standardError: 2.5, n: 30, xMean: 14.5, sxx: 850 },
+      basis: { count: 30, firstDate: "2026-10-01", lastDate: "2026-10-30" },
+      current: { date: "2026-10-30", value: 100 },
+      history: Array.from({ length: 30 }, (_, index) => ({
+        date: `2026-10-${String(index + 1).padStart(2, "0")}`,
+        value: 91 + index + (index % 3),
+      })),
+      stats: { min: 91, max: 122, mean: 105, stdevPercent: 8.2 },
+      projected: Array.from({ length: 7 }, (_, index) => ({
+        date: `2026-11-0${index + 1}`, expected: 108, lower: 101, upper: 115,
+      })),
+      changePercent: 8, direction: "Bullish",
+      method: "TEST FIXTURE: Ordinary least squares linear regression; not financial advice.",
+    } });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "Outlook", exact: true }).click();
+  const outlook = page.locator(".outlook");
+  await expect(outlook.locator(".forecast-badge")).toHaveText(/Bullish\s*\+8/);
+  await expect(outlook).toContainText("Model fit (R²)");
+  await expect(outlook).toContainText("42% · Medium");
+  await expect(outlook).toContainText("Observations used");
+  await expect(outlook).toContainText("30 days");
+  await expect(outlook).toContainText("Upper");
+  await expect(outlook).toContainText("Not a prediction service, AI");
+  await expect(outlook).toContainText("Based on 30 daily observations");
+  await expect(outlook).toContainText("Daily trend");
+  await expect(outlook.getByText("/day", { exact: false })).toBeVisible();
+  await expect(outlook).toContainText("Lookback low");
+  await expect(outlook).toContainText("Volatility (stdev)");
+  await expect(outlook).toContainText("8.2%");
+  await expect(outlook.locator(".fit-gauge")).toBeVisible();
+  await expect(
+    outlook.getByRole("img", { name: /real daily observations/ }),
+  ).toBeVisible();
+  await expect(outlook.getByText("How we got this number (methodology)", { exact: true })).toBeVisible();
+  await expect(outlook).toContainText("expected(days ahead) = today's price + slope × days ahead");
+  await expect(outlook).toContainText("day 0 is 2026-10-01");
+  await outlook.getByText("Day-by-day projection (7)", { exact: true }).click();
+  const forecastRows = outlook.locator(".forecast-table tbody tr");
+  await expect(forecastRows).toHaveCount(7);
+  await expect(forecastRows.first()).toContainText("+8.00%");
+});
+
+test("jewelry price estimator adds making charges and tax to the reference rate", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Estimator", exact: true }).click();
+  const estimator = page.locator(".estimator-section");
+  await expect(estimator.getByText("Jewelry price estimator", { exact: true })).toBeVisible();
+  const rateCell = estimator.locator(".calc-breakdown-row").first().locator("strong");
+  await expect(rateCell).not.toHaveText("Unavailable / g");
+  await expect(rateCell).toContainText("₹");
+  await estimator.getByLabel("Gross weight (g)").fill("10");
+  await estimator.getByLabel("Stone weight (g)").fill("2");
+  await expect(estimator).toContainText("8 g");
+  await estimator.getByLabel("Making charges (%)").fill("10");
+  await estimator.getByLabel("Tax / VAT (%)").fill("5");
+  const sourceProduct = estimator.getByLabel("Source product");
+  await expect(sourceProduct).toBeVisible();
+  await expect(estimator).toContainText("Raksha source SELL rate");
+  await expect(estimator.getByLabel("Purity")).toHaveCount(0);
+  const totalBefore = await estimator.locator(".calc-breakdown-total strong").innerText();
+  await estimator.getByLabel("Region").selectOption("Netherlands");
+  await expect(sourceProduct).toHaveCount(0);
+  const purity = estimator.getByLabel("Purity");
+  expect(await purity.locator("option").allTextContents()).toEqual(["24K", "22K", "18K", "14K"]);
+  await expect(purity).toHaveValue("22");
+  await expect(estimator).toContainText("International reference rate");
+  await expect(estimator.locator(".calc-breakdown-row").first().locator("strong")).toContainText("€");
+  const totalAfter = await estimator.locator(".calc-breakdown-total strong").innerText();
+  expect(totalAfter).not.toBe(totalBefore);
+  await expect(estimator).toContainText("Making charges (10%)");
+  await expect(estimator).toContainText("Tax / VAT (5%)");
+  await expect(estimator.getByRole("button", { name: "Print estimate", exact: true })).toBeVisible();
+});
+
 test("seven-day chart defaults to today-inclusive hourly observations", async ({
   page,
   request,
@@ -265,7 +361,7 @@ test("seven-day chart defaults to today-inclusive hourly observations", async ({
   ).toBeVisible();
   const chartPurity = page.getByRole("group", { name: "Chart purity" });
   await expect(chartPurity.getByRole("button", { name: "24K", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await expect(page.locator(".recharts-area-curve")).toHaveAttribute("d", /M/);
+  await expect(page.locator(".chart-section .recharts-area-curve")).toHaveAttribute("d", /M/);
   await page.getByText("View observations (3)", { exact: true }).click();
   await expect(page.locator(".history-table tbody tr")).toHaveCount(3);
   const detail = page.getByRole("group", { name: "Observation table detail", exact: true });

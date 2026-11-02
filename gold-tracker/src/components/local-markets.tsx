@@ -17,8 +17,8 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { convert, countryPurities, metalPrice, purityFraction, purityLabel, type Currency, type Rates } from "@/lib/finance";
-import type { DealerFeed, DealerQuote, dealers } from "@/lib/dealers";
+import { convert, countryPurities, metalPrice, purityLabel, type Currency, type Rates } from "@/lib/finance";
+import type { DealerFeed, DealerQuote, RakshaRow, dealers } from "@/lib/dealers";
 import type { StandardBullionFeed } from "@/lib/market";
 
 type DealerState = Awaited<ReturnType<typeof dealers>>;
@@ -69,6 +69,7 @@ export default function LocalMarkets({
   const [busy, setBusy] = useState(true);
   const [editing, setEditing] = useState<"India" | "Netherlands" | null>(null);
   const [version, setVersion] = useState(0);
+  const [indiaProductId, setIndiaProductId] = useState("");
   const [purities, setPurities] = useState<Record<"India" | "Netherlands", number>>({ India: 24, Netherlands: 24 });
   const [currencies, setCurrencies] = useState<Record<"India" | "Netherlands", Currency>>({
     India: "INR",
@@ -79,6 +80,8 @@ export default function LocalMarkets({
     let active = true;
     void Promise.resolve().then(() => {
       try {
+        const savedProduct = localStorage.getItem("aurum-india-source-product");
+        if (active && savedProduct) setIndiaProductId(savedProduct);
         const saved = JSON.parse(localStorage.getItem("aurum-market-currencies") || "null");
         if (active && saved && ["INR", "EUR"].includes(saved.India) && ["INR", "EUR"].includes(saved.Netherlands)) {
           setCurrencies({ India: saved.India, Netherlands: saved.Netherlands });
@@ -101,8 +104,9 @@ export default function LocalMarkets({
     if (preferencesReady) {
       localStorage.setItem("aurum-market-currencies", JSON.stringify(currencies));
       localStorage.setItem("aurum-market-purities", JSON.stringify(purities));
+      localStorage.setItem("aurum-india-source-product", indiaProductId);
     }
-  }, [currencies, purities, preferencesReady]);
+  }, [currencies, purities, indiaProductId, preferencesReady]);
   useEffect(() => {
     let active = true;
     const load = async () => {
@@ -177,6 +181,11 @@ export default function LocalMarkets({
           const saved =
             data?.quotes.filter((quote) => quote.country === country) || [];
           const standard = data?.standardBullion;
+          const rows = data?.raksha.rows || [];
+          const matching = rows.filter(row => row.fineness === (purities.India === 995 ? 995 : 999));
+          const indianProduct = indiaProductId
+            ? rows.find(row => row.id === indiaProductId)
+            : matching.find(row => row.gst === "Not stated") || matching[0] || rows[0];
           const sourceAmount = (inrAmount: number | null) =>
             inrAmount === null
               ? null
@@ -222,18 +231,25 @@ export default function LocalMarkets({
                       <option value="EUR">EUR</option>
                     </select>
                   </InputField>
-                  <InputField label={`${country} reference purity`} displayLabel="Purity">
+                  {country === "India" ? (
+                    <InputField label="India source product" displayLabel="Source product">
+                      <select value={indianProduct?.id || indiaProductId} disabled={!rows.length} onChange={event => setIndiaProductId(event.target.value)}>
+                        {!indianProduct && <option value={indiaProductId}>{indiaProductId ? "Selected product unavailable" : "No source products"}</option>}
+                        {rows.map(row => <option key={row.id} value={row.id}>{row.label}</option>)}
+                      </select>
+                    </InputField>
+                  ) : <InputField label={`${country} reference purity`} displayLabel="Purity">
                     <select value={purities[country]} onChange={(event) => setPurities((current) => ({ ...current, [country]: Number(event.target.value) }))}>
                       {countryPurities[country].map(value => <option key={value} value={value}>{purityLabel(value)}</option>)}
                     </select>
-                  </InputField>
+                  </InputField>}
                   <span className="text-badge">
                     {country === "India" ? "INDIAN REFERENCE" : "GLOBAL REFERENCE"}
                   </span>
                 </div>
               </div>
               {country === "India" ? (
-                <IndianReference feed={data?.raksha} currency={displayed} rates={rates} purity={purities.India} weight={weight} fxObservedAt={fxObservedAt} fxStale={fxStale} />
+                <IndianReference feed={data?.raksha} product={indianProduct} currency={displayed} rates={rates} weight={weight} fxObservedAt={fxObservedAt} fxStale={fxStale} />
               ) : (
                 <LiveReference feed={standard} country={country} currency={displayed} rates={rates} purity={purities[country]} weight={weight} fxObservedAt={fxObservedAt} fxStale={fxStale} />
               )}
@@ -453,24 +469,18 @@ export default function LocalMarkets({
     </section>
   );
 }
-function IndianReference({ feed, currency, rates, purity, weight, fxObservedAt, fxStale }: {
+function IndianReference({ feed, product, currency, rates, weight, fxObservedAt, fxStale }: {
   feed?: DealerFeed;
+  product?: RakshaRow;
   currency: Currency;
   rates?: Rates;
-  purity: number;
   weight: number;
   fxObservedAt: string | null;
   fxStale: boolean;
 }) {
-  const rows = feed?.rows || [];
-  const matching = rows.filter(row => row.fineness === (purity === 995 ? 995 : 999));
-  const product = matching.find(row => row.gst === "Not stated")
-    || matching[0]
-    || rows.find(row => row.fineness === 999)
-    || rows[0];
   const converted = (amount: number | null, grams = 1) => {
     if (amount === null || !product || !feed?.unitGrams) return null;
-    const inr = amount * grams / feed.unitGrams * purityFraction(purity) / (product.fineness / 1000);
+    const inr = amount * grams / feed.unitGrams;
     return currency === "INR" ? inr : rates ? convert(inr, "INR", currency, rates) : null;
   };
   return (
@@ -482,12 +492,12 @@ function IndianReference({ feed, currency, rates, purity, weight, fxObservedAt, 
       {product ? (
         <>
           <div className="spot-quote-grid">
-            <div className="spot-quote-value"><span>Raksha source BUY · {currency} / g</span><strong>{price(converted(product.buy), currency)}</strong><small>per 1g · {purityLabel(purity)} estimate</small><small>{price(converted(product.buy, weight), currency)} total for {weight}g</small></div>
-            <div className="spot-quote-value"><span>Raksha source SELL · {currency} / g</span><strong>{price(converted(product.sell), currency)}</strong><small>per 1g · {purityLabel(purity)} estimate</small><small>{price(converted(product.sell, weight), currency)} total for {weight}g</small></div>
+            <div className="spot-quote-value"><span>Raksha source BUY · {currency} / g</span><strong>{price(converted(product.buy), currency)}</strong><small>per 1g · {product.fineness} fine · source quote</small><small>{price(converted(product.buy, weight), currency)} total for {weight}g</small></div>
+            <div className="spot-quote-value"><span>Raksha source SELL · {currency} / g</span><strong>{price(converted(product.sell), currency)}</strong><small>per 1g · {product.fineness} fine · source quote</small><small>{price(converted(product.sell, weight), currency)} total for {weight}g</small></div>
           </div>
           <div className="dealer-assumptions">
             <p>Based on {product.label} ({product.fineness} fine). GST: {product.gst}. No additional tax added. Source note: {product.sourceNote}.</p>
-            <p>Calculated from this Indian dealer quote using the selected purity and weight; not a directly quoted jewellery price. {feed?.unitGrams ? `Source weight assumed ${feed.unitGrams}g; not verified by Raksha.` : "Source weight is unknown; normalized reference unavailable."}</p>
+            <p>Original BUY/SELL for the selected product, scaled only for weight and currency. No purity adjustment or extra GST. {feed?.unitGrams ? `Source weight assumed ${feed.unitGrams}g; not verified by Raksha.` : "Source weight is unknown; normalized reference unavailable."}</p>
             <p>Provider observation: not supplied as a reliable timestamp. App retrieval: {timestamp(feed?.retrievedAt || null)}.{feed?.error ? ` Cached quote is stale: ${feed.error}.` : ""}</p>
             {currency !== "INR" && <p>INR converted using Frankfurter daily FX observed {fxObservedAt?.slice(0, 10) || "unavailable"}{fxStale ? " (stale)" : ""}.</p>}
           </div>

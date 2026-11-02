@@ -6,7 +6,9 @@ test("Netherlands EUR reference and optional product quotes remain distinct", as
   baseURL,
 }) => {
   await page.setViewportSize({ width: 1440, height: 1100 });
+  const dealerResponse = page.waitForResponse(response => response.url().endsWith("/api/dealers") && response.ok());
   await page.goto("/");
+  const sourceData = await (await dealerResponse).json();
   const india = page.getByRole("region", {
     name: "India dealer prices",
     exact: true,
@@ -18,7 +20,7 @@ test("Netherlands EUR reference and optional product quotes remain distinct", as
   await expect(
     india.getByText("Raksha Bullion · Mumbai", { exact: true }).first(),
   ).toBeVisible();
-  await expect(india.locator(".indian-reference .source-caution")).toContainText("Auto-refresh · fetched");
+  await expect(india.locator(".indian-reference .source-caution")).toContainText(sourceData.raksha.error ? "Stale / unavailable" : "Auto-refresh · fetched");
   await india.getByText("Original Raksha dealer quotes", { exact: true }).click();
   const indiaCurrency = page.getByLabel("India quote currency");
   const nlCurrency = page.getByLabel("Netherlands quote currency");
@@ -39,19 +41,22 @@ test("Netherlands EUR reference and optional product quotes remain distinct", as
   await expect(nl).toContainText("not a Netherlands-specific product price");
   const indianReference = india.locator(".indian-reference");
   await expect(india.locator(".live-reference")).toHaveCount(0);
-  await expect(indianReference).toContainText("per 1g · 24K estimate");
+  await expect(indianReference).toContainText("per 1g · 999 fine · source quote");
   await expect(indianReference).toContainText("total for 10g");
   await expect(nl.locator(".live-reference")).toContainText("per 1g · 24K equivalent");
   await expect(nl.locator(".live-reference")).toContainText("total for 10g");
-  const indiaReference24 = await indianReference.locator(".spot-quote-value strong").first().innerText();
-  await page.getByLabel("India reference purity").selectOption("22");
-  await expect(indianReference).toContainText("per 1g · 22K estimate");
-  expect(await indianReference.locator(".spot-quote-value strong").first().innerText()).not.toBe(indiaReference24);
+  const indiaSource = page.getByLabel("India source product");
+  const initialProduct = await indiaSource.inputValue();
+  const indiaReference999 = await indianReference.locator(".spot-quote-value strong").first().innerText();
+  const alternativeProduct = await indiaSource.locator("option").filter({ hasText: /GOLD 995/i }).first().getAttribute("value");
+  await indiaSource.selectOption(alternativeProduct!);
+  await expect(indianReference).toContainText("per 1g · 995 fine · source quote");
+  expect(await indianReference.locator(".spot-quote-value strong").first().innerText()).not.toBe(indiaReference999);
   await expect(page.getByLabel("Netherlands reference purity")).toHaveValue("24");
-  await page.getByLabel("India reference purity").selectOption("24");
+  await indiaSource.selectOption(initialProduct);
   await page.getByLabel("Shared reference weight (g)").fill("5");
   await expect(indianReference).toContainText("total for 5g");
-  await expect(indianReference.locator(".spot-quote-value strong").first()).toHaveText(indiaReference24);
+  await expect(indianReference.locator(".spot-quote-value strong").first()).toHaveText(indiaReference999);
   await expect(nl.locator(".live-reference")).toContainText("total for 5g");
   await page.getByLabel("Shared reference weight (g)").fill("10");
   const nlAmountInEur = await nl.locator(".spot-quote-value strong").first().innerText();
@@ -126,24 +131,34 @@ test("Indian reference uses Raksha per gram, preserves GST and never substitutes
   await page.goto("/");
   const india = page.getByRole("region", { name: "India dealer prices", exact: true });
   const reference = india.locator(".indian-reference");
-  await expect(page.getByLabel("India reference product")).toHaveCount(0);
-  await page.getByLabel("India reference purity").selectOption("999");
+  const source = page.getByLabel("India source product");
+  await expect(page.getByLabel("India reference purity")).toHaveCount(0);
+  await expect(source).toHaveValue("999");
+  expect(await source.locator("option").allTextContents()).toEqual(["GOLD 999 WITH GST TEST FIXTURE", "GOLD 999 TEST FIXTURE", "GOLD 995 TEST FIXTURE"]);
   const buy = reference.locator(".spot-quote-value").first();
   await expect(buy.locator("strong")).toHaveText("₹10,000.00");
   await expect(buy).toContainText("₹1,00,000.00 total for 10g");
   await expect(reference).toContainText("GST: Not stated");
-  await page.getByLabel("India reference purity").selectOption("22");
-  await expect(buy.locator("strong")).toHaveText("₹9,175.84");
-  await page.getByLabel("India reference purity").selectOption("995");
+  await source.selectOption("995");
   await expect(buy.locator("strong")).toHaveText("₹9,000.00");
   await expect(reference).toContainText("Based on GOLD 995 TEST FIXTURE");
-  await page.getByLabel("India reference purity").selectOption("999");
+  await page.reload();
+  await expect(source).toHaveValue("995");
+  await expect(buy.locator("strong")).toHaveText("₹9,000.00");
+  await source.selectOption("gst999");
+  await expect(buy.locator("strong")).toHaveText("₹10,200.00");
+  await expect(reference.locator(".spot-quote-value").nth(1).locator("strong")).toHaveText("₹10,300.00");
+  await expect(reference).toContainText("GST: Included (source label)");
+  await source.selectOption("999");
   await expect(buy.locator("strong")).toHaveText("₹10,000.00");
   await page.getByLabel("Shared reference weight (g)").fill("5");
   await expect(buy.locator("strong")).toHaveText("₹10,000.00");
   await expect(buy).toContainText("₹50,000.00 total for 5g");
   onlyGst = true;
   await page.reload();
+  await expect(reference).toContainText("Indian reference unavailable.");
+  await expect(source).toHaveValue("999");
+  await source.selectOption("gst999");
   await expect(buy.locator("strong")).toHaveText("₹10,200.00");
   await expect(buy).toContainText("₹51,000.00 total for 5g");
   await expect(reference).toContainText("GST: Included (source label)");
@@ -164,12 +179,14 @@ test("Netherlands purity options are country-specific and migrate an old finenes
   const purity = page.getByLabel("Netherlands reference purity");
   await expect(purity).toHaveValue("24");
   expect(await purity.locator("option").allTextContents()).toEqual(["24K", "22K", "18K", "14K"]);
-  await expect(page.getByLabel("India reference purity")).toHaveValue("999");
+  const indiaSource = page.getByLabel("India source product");
+  await expect(indiaSource.locator("option:checked")).toContainText("999");
+  const selectedProduct = await indiaSource.inputValue();
   const quote = nl.locator(".spot-quote-value strong").first();
   await expect(quote).not.toHaveText("Unavailable");
   const before = await quote.innerText();
   await purity.selectOption("14");
   await expect(nl).toContainText("per 1g · 14K equivalent");
   expect(await quote.innerText()).not.toBe(before);
-  await expect(page.getByLabel("India reference purity")).toHaveValue("999");
+  await expect(indiaSource).toHaveValue(selectedProduct);
 });

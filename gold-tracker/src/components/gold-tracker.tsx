@@ -17,6 +17,7 @@ import {
   Area,
   AreaChart,
   CartesianGrid,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -26,6 +27,7 @@ import {
   ArrowDownUp,
   ArrowUpRight,
   Bell,
+  Calculator as CalculatorIcon,
   Check,
   ChevronRight,
   CircleHelp,
@@ -33,14 +35,18 @@ import {
   Gem,
   LayoutDashboard,
   LoaderCircle,
+  Minus,
   Moon,
   Pencil,
   Plus,
+  Printer,
   RefreshCw,
   Settings2,
   ShieldCheck,
   Sun,
   Trash2,
+  TrendingDown,
+  TrendingUp,
   Upload,
   Wallet,
   X,
@@ -49,6 +55,7 @@ import Papa from "papaparse";
 import {
   compareQuotes,
   convert,
+  countryPurities,
   metalPrice,
   purityLabel,
   purityValues,
@@ -62,7 +69,7 @@ import {
 } from "@/lib/finance";
 import type { Cached, HistoryPoint } from "@/lib/market";
 
-type View = "Dashboard" | "Compare" | "Portfolio" | "Alerts" | "Settings";
+type View = "Dashboard" | "Outlook" | "Estimator" | "Compare" | "Portfolio" | "Alerts" | "Settings";
 type Holding = Purchase & {
   fxDate: string | null;
   goldDate: string | null;
@@ -92,6 +99,32 @@ type History = Cached<HistoryPoint[]> & {
   grain?: "daily";
   sourceUrl?: string;
 };
+type ForecastPoint = { date: string; expected: number; lower: number; upper: number };
+type Forecast = {
+  error: string | null;
+  sourceError: string | null;
+  stale: boolean;
+  country: "India" | "Netherlands";
+  currency: Currency;
+  horizonDays: number;
+  method: string;
+  regression: {
+    rSquared: number;
+    slope: number;
+    intercept: number;
+    standardError: number;
+    n: number;
+    xMean: number;
+    sxx: number;
+  } | null;
+  basis: { count: number; firstDate: string; lastDate: string } | null;
+  current: { date: string; value: number } | null;
+  history: { date: string; value: number }[];
+  stats: { min: number; max: number; mean: number; stdevPercent: number } | null;
+  projected: ForecastPoint[];
+  changePercent: number | null;
+  direction: "Bullish" | "Bearish" | "Neutral" | null;
+};
 type Preferences = {
   currency: "Local" | Currency;
   purity: number;
@@ -110,6 +143,8 @@ const defaults: Preferences = {
 };
 const icons = {
   Dashboard: LayoutDashboard,
+  Outlook: TrendingUp,
+  Estimator: CalculatorIcon,
   Compare: ArrowDownUp,
   Portfolio: Wallet,
   Alerts: Bell,
@@ -133,6 +168,8 @@ const time = (value: string | null | undefined) =>
       })
     : "Unavailable";
 const signed = (value: number) => `${value > 0 ? "+" : ""}${value.toFixed(2)}%`;
+const fitQuality = (rSquared: number | undefined) =>
+  !rSquared || rSquared < 0.2 ? "Low" : rSquared < 0.5 ? "Medium" : "High";
 async function api<T>(url: string, method = "GET", body?: unknown): Promise<T> {
   const response = await fetch(url, {
     method,
@@ -201,6 +238,8 @@ export default function GoldTracker() {
   const [ready, setReady] = useState(false);
   const [data, setData] = useState<State | null>(null);
   const [history, setHistory] = useState<History | null>(null);
+  const [forecast, setForecast] = useState<Forecast | null>(null);
+  const [forecastBusy, setForecastBusy] = useState(true);
   const [busy, setBusy] = useState(true);
   const [chartBusy, setChartBusy] = useState(true);
   const [error, setError] = useState("");
@@ -335,6 +374,30 @@ export default function GoldTracker() {
     };
   }, [ready, preferences.days, preferences.chartCountry, revision]);
   useEffect(() => {
+    if (!ready) return;
+    let active = true;
+    const forecastCurrency = preferences.chartCountry === "India" ? "INR" : "EUR";
+    const load = async (background = false) => {
+      if (!background) setForecastBusy(true);
+      try {
+        const result = await api<Forecast>(
+          `/api/forecast?country=${preferences.chartCountry}&currency=${forecastCurrency}&days=30`,
+        );
+        if (active) setForecast(result);
+      } catch {
+        if (active) setForecast(null);
+      } finally {
+        if (active) setForecastBusy(false);
+      }
+    };
+    void load();
+    const timer = setInterval(() => void load(true), 60000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [ready, preferences.chartCountry, revision]);
+  useEffect(() => {
     if (!toast) return;
     const timer = setTimeout(() => setToast(""), 5000);
     return () => clearTimeout(timer);
@@ -359,6 +422,8 @@ export default function GoldTracker() {
   };
   const title = {
     Dashboard: "Market overview",
+    Outlook: "Price outlook",
+    Estimator: "Jewelry price estimator",
     Compare: "Compare like for like",
     Portfolio: "Your gold ledger",
     Alerts: "Price alerts",
@@ -447,7 +512,11 @@ export default function GoldTracker() {
               <p>
                 {view === "Dashboard"
                   ? "India dealer rates and a live EUR gold reference for the Netherlands view."
-                  : view === "Compare"
+                  : view === "Outlook"
+                    ? "A statistical trend line over real price history, with the exact math shown."
+                    : view === "Estimator"
+                      ? "Add making charges and tax to the international reference rate."
+                      : view === "Compare"
                     ? "Normalized quotes, with every assumption in view."
                     : view === "Portfolio"
                       ? "Your purchases and indicative metal value, in one place."
@@ -801,21 +870,21 @@ export default function GoldTracker() {
                   />
                 </section>
               </div>
-              <div className="bottom-grid">
-                <SourcePanel data={data} />
-                <section className="outlook">
-                  <span className="eyebrow">OUTLOOK</span>
-                  <h2>History, without the crystal ball.</h2>
-                  <p>
-                    Forecasts are unavailable. A verified long-term dataset and
-                    an out-of-sample evaluated method are not configured. No
-                    predicted prices or confidence scores are generated.
-                  </p>
-                  <span className="text-badge">No forecast model</span>
-                </section>
-              </div>
+              <SourcePanel data={data} />
             </>
           )}
+
+          {view === "Outlook" && (
+            <OutlookView
+              forecast={forecast}
+              forecastBusy={forecastBusy}
+              country={preferences.chartCountry}
+              onCountryChange={(chartCountry) => change({ chartCountry })}
+            />
+          )}
+
+          {view === "Estimator" && <JewelryEstimator price={price} />}
+
           {view === "Compare" && (
             <Compare
               rates={rates}
@@ -1001,6 +1070,327 @@ function HistoryChart({
     </>
   );
 }
+function OutlookView({
+  forecast,
+  forecastBusy,
+  country,
+  onCountryChange,
+}: {
+  forecast: Forecast | null;
+  forecastBusy: boolean;
+  country: "India" | "Netherlands";
+  onCountryChange: (country: "India" | "Netherlands") => void;
+}) {
+  const dayOffset = (date: string, firstDate: string) =>
+    Math.round(
+      (Date.parse(`${date.slice(0, 10)}T00:00:00Z`) -
+        Date.parse(`${firstDate.slice(0, 10)}T00:00:00Z`)) /
+        86400000,
+    );
+  const regression = forecast?.regression;
+  const basis = forecast?.basis;
+  const final = forecast?.projected.at(-1);
+  const lastOffset = basis ? dayOffset(basis.lastDate, basis.firstDate) : 0;
+  const finalOffset = final && basis ? dayOffset(final.date, basis.firstDate) : 0;
+  return (
+    <section className="outlook">
+      <div className="section-heading">
+        <div>
+          <span className="eyebrow">PRICE OUTLOOK</span>
+          <h2>{forecast?.horizonDays || 7}-day statistical projection · {country}</h2>
+        </div>
+        <Segments
+          label="Outlook country"
+          value={country}
+          onChange={onCountryChange}
+          values={[{ value: "India", label: "India" }, { value: "Netherlands", label: "Netherlands" }]}
+        />
+      </div>
+      <div className="outlook-head">
+        {forecast?.direction && (
+          <span className={`forecast-badge ${forecast.direction.toLowerCase()}`}>
+            {forecast.direction === "Bullish" ? <TrendingUp size={13} /> : forecast.direction === "Bearish" ? <TrendingDown size={13} /> : <Minus size={13} />}
+            {forecast.direction}
+            {forecast.changePercent !== null && ` ${signed(forecast.changePercent)}`}
+          </span>
+        )}
+      </div>
+      <p>
+        A single-factor linear regression fitted to real historical
+        observations — a day index against price, nothing else — estimates a
+        daily trend. The projection then drifts forward from today&apos;s
+        actual price using that trend, so it always starts where the real
+        data ends. Unlike services that claim to also model the US dollar
+        index, interest rates or news sentiment, this app only has the price
+        history it retrieves, so that is all this model uses. Not a
+        prediction service, AI model or financial advice.
+      </p>
+      {forecastBusy && !forecast ? (
+        <p className="dealer-loading" role="status">
+          <LoaderCircle className="spin" size={16} /> Fitting trend
+        </p>
+      ) : forecast?.error || !forecast?.current || !forecast.projected.length || !regression || !basis || !final ? (
+        <span className="text-badge">{forecast?.error || "Projection unavailable"}</span>
+      ) : (
+        <>
+          <div className="forecast-stats">
+            <Metric label={`Current (${forecast.currency}/g, 24K)`} value={money(forecast.current.value, forecast.currency)} />
+            <Metric label={`Projected (${forecast.horizonDays}d)`} value={money(final.expected, forecast.currency)} />
+            <Metric
+              label="Daily trend"
+              value={`${money(regression.slope, forecast.currency)}/day`}
+              className={regression.slope < 0 ? "negative" : "positive"}
+            />
+            <Metric
+              label="Model fit (R²)"
+              value={`${(regression.rSquared * 100).toFixed(0)}% · ${fitQuality(regression.rSquared)}`}
+            />
+          </div>
+          <FitGauge rSquared={regression.rSquared} />
+          {forecast.stats && (
+            <div className="forecast-stats">
+              <Metric label="Lookback low" value={money(forecast.stats.min, forecast.currency)} />
+              <Metric label="Lookback high" value={money(forecast.stats.max, forecast.currency)} />
+              <Metric label="Lookback average" value={money(forecast.stats.mean, forecast.currency)} />
+              <Metric label="Volatility (stdev)" value={`${forecast.stats.stdevPercent.toFixed(1)}%`} />
+            </div>
+          )}
+          <div className="forecast-stats">
+            <Metric label="Lower (90% band)" value={money(final.lower, forecast.currency)} />
+            <Metric label="Expected" value={money(final.expected, forecast.currency)} />
+            <Metric label="Upper (90% band)" value={money(final.upper, forecast.currency)} />
+            <Metric label="Observations used" value={`${basis.count} days`} />
+          </div>
+          <div className="forecast-range" aria-label="7-day projected range, approximate 90% band">
+            <div className="forecast-range-bar">
+              <span className="forecast-range-fill" style={{ opacity: 0.35 }} />
+            </div>
+            <div className="forecast-range-labels">
+              <span>Lower {money(final.lower, forecast.currency)}</span>
+              <span>Expected {money(final.expected, forecast.currency)}</span>
+              <span>Upper {money(final.upper, forecast.currency)}</span>
+            </div>
+          </div>
+          <ForecastChart forecast={forecast} />
+          <details className="chart-table" open>
+            <summary>How we got this number (methodology)</summary>
+            <div className="methodology">
+              <p>
+                Every real daily observation is given a day index: day 0 is{" "}
+                {basis.firstDate} (the oldest observation used), counting up
+                to day {lastOffset} for the most recent one, {basis.lastDate}.
+                A straight line is then fitted through all {basis.count} (day
+                index, price) pairs using ordinary least squares — the same
+                technique spreadsheets use for a trendline. That fit is used
+                only to estimate a daily trend (the slope); the projection
+                itself starts from today&apos;s actual price, not from the
+                fitted line, so it never contradicts the latest real
+                observation.
+              </p>
+              <div className="methodology-formula">
+                expected(days ahead) = today&apos;s price + slope × days ahead
+                <br />
+                expected({forecast.horizonDays}) = {money(forecast.current.value, forecast.currency)} + ({regression.slope.toFixed(4)} × {forecast.horizonDays})
+                <br />
+                = {money(forecast.current.value + regression.slope * forecast.horizonDays, forecast.currency)} per gram
+              </div>
+              <p>
+                The slope itself comes from the trend line: slope ={" "}
+                {regression.slope.toFixed(4)} {forecast.currency}/g per day,
+                intercept = {regression.intercept.toFixed(2)}{" "}
+                {forecast.currency}/g (the fitted line&apos;s own value at day
+                0). The confidence band adds the regression&apos;s own
+                residual error: wider when day {finalOffset} is far from the
+                middle of the {basis.count} days used to fit the line, or
+                when the real prices scattered widely around the fitted
+                line.
+              </p>
+              <div className="methodology-formula">
+                lower/upper = expected ± 1.645 × standard error ×{" "}
+                √(1 + 1/n + (day − mean day)² / Σ(day − mean day)²)
+                <br />
+                standard error of the fit = {regression.standardError.toFixed(2)}{" "}
+                {forecast.currency}/g over n = {regression.n} observations
+              </div>
+              <p className="fine-print">
+                R² = {(regression.rSquared * 100).toFixed(1)}% measures how
+                closely the {basis.count} real points sit to that straight
+                line — not how accurate the projection will be. Gold prices
+                are driven by many factors a single trend line cannot
+                capture.
+              </p>
+            </div>
+          </details>
+          <details className="chart-table">
+            <summary>Day-by-day projection ({forecast.projected.length})</summary>
+            <div className="table-scroll forecast-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date</th>
+                    <th>Expected</th>
+                    <th>Lower</th>
+                    <th>Upper</th>
+                    <th>vs today</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {forecast.projected.map((point) => (
+                    <tr key={point.date}>
+                      <td>{new Date(`${point.date}T00:00:00Z`).toLocaleDateString("en", { timeZone: "UTC", weekday: "short", month: "short", day: "numeric" })}</td>
+                      <td>{money(point.expected, forecast.currency)}</td>
+                      <td>{money(point.lower, forecast.currency)}</td>
+                      <td>{money(point.upper, forecast.currency)}</td>
+                      <td className={forecast.current && point.expected < forecast.current.value ? "negative" : "positive"}>
+                        {forecast.current ? signed(((point.expected - forecast.current.value) / forecast.current.value) * 100) : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+          <p className="fine-print">
+            Based on {basis.count} daily observations, {basis.firstDate} to{" "}
+            {basis.lastDate}. Approximate 90% range assumes normally
+            distributed residuals around the fitted trend; it is a
+            simplification, not a guarantee.
+            {forecast.stale && " Underlying price history is stale."}
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+function ForecastChart({ forecast }: { forecast: Forecast }) {
+  const regression = forecast.regression;
+  const basis = forecast.basis;
+  if (!regression || !basis || !forecast.history.length) return null;
+  const label = (date: string) =>
+    new Date(`${date}T00:00:00Z`).toLocaleDateString("en", { timeZone: "UTC", month: "short", day: "numeric" });
+  const offset = (date: string) =>
+    Math.round(
+      (Date.parse(`${date.slice(0, 10)}T00:00:00Z`) - Date.parse(`${basis.firstDate.slice(0, 10)}T00:00:00Z`)) /
+        86400000,
+    );
+  const history = forecast.history.map((point) => ({
+    date: point.date,
+    label: label(point.date),
+    actual: point.value,
+    fittedHistory: regression.intercept + regression.slope * offset(point.date),
+    fittedProjection: null as number | null,
+    band: null as [number, number] | null,
+  }));
+  if (history.length)
+    history[history.length - 1].fittedProjection =
+      forecast.current?.value ?? history[history.length - 1].fittedHistory;
+  const projected = forecast.projected.map((point) => ({
+    date: point.date,
+    label: label(point.date),
+    actual: null as number | null,
+    fittedHistory: null as number | null,
+    fittedProjection: point.expected,
+    band: [point.lower, point.upper] as [number, number],
+  }));
+  const data = [...history, ...projected];
+  const todayLabel = history.at(-1)?.label;
+  return (
+    <div
+      className="chart forecast-chart"
+      role="img"
+      aria-label={`${basis.count} real daily observations in ${forecast.currency} per gram, with the fitted trend line through them and its ${forecast.horizonDays}-day projection with an approximate 90% band beyond today. Data table below.`}
+    >
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={data} margin={{ left: 10, right: 16, top: 10, bottom: 4 }}>
+          <defs>
+            <linearGradient id="forecast-fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="var(--chart-fill)" stopOpacity={0.3} />
+              <stop offset="100%" stopColor="var(--chart-fill)" stopOpacity={0.03} />
+            </linearGradient>
+          </defs>
+          <CartesianGrid vertical={false} stroke="var(--line)" strokeDasharray="3 5" />
+          <XAxis
+            dataKey="label"
+            tickLine={false}
+            axisLine={false}
+            minTickGap={28}
+            tick={{ fontSize: 10, fill: "var(--subtle)" }}
+          />
+          <YAxis
+            domain={["auto", "auto"]}
+            tickFormatter={(value) => number(Number(value))}
+            width={60}
+            tickLine={false}
+            axisLine={false}
+            tick={{ fontSize: 10, fill: "var(--subtle)" }}
+          />
+          <Tooltip
+            formatter={(value, name) => [
+              money(Array.isArray(value) ? value[1] : Number(value), forecast.currency),
+              name === "band"
+                ? "Lower–upper range"
+                : name === "actual"
+                  ? "Actual observation"
+                  : name === "fittedProjection"
+                    ? "Projected (from today's price)"
+                    : "Fitted trend (historical fit)",
+            ]}
+            contentStyle={{ borderRadius: 4, borderColor: "var(--line)", backgroundColor: "var(--surface)", color: "var(--ink)" }}
+          />
+          {todayLabel && (
+            <ReferenceLine
+              x={todayLabel}
+              stroke="var(--subtle)"
+              strokeDasharray="4 4"
+              label={{ value: "Today", position: "insideTopRight", fill: "var(--subtle)", fontSize: 10 }}
+            />
+          )}
+          <Area
+            type="monotone"
+            dataKey="band"
+            name="band"
+            stroke="none"
+            fill="url(#forecast-fill)"
+            isAnimationActive={false}
+            connectNulls={false}
+          />
+          <Area
+            type="monotone"
+            dataKey="actual"
+            name="actual"
+            stroke="var(--green)"
+            strokeWidth={2}
+            fill="none"
+            isAnimationActive={false}
+            connectNulls
+            dot={false}
+          />
+          <Area
+            type="monotone"
+            dataKey="fittedHistory"
+            name="fittedHistory"
+            stroke="var(--chart-line)"
+            strokeWidth={2}
+            fill="none"
+            isAnimationActive={false}
+            connectNulls
+          />
+          <Area
+            type="monotone"
+            dataKey="fittedProjection"
+            name="fittedProjection"
+            stroke="var(--chart-line)"
+            strokeWidth={2}
+            strokeDasharray="5 4"
+            fill="none"
+            isAnimationActive={false}
+            connectNulls
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
 function Calculator({
   purity,
   weight,
@@ -1069,6 +1459,159 @@ function Calculator({
         No tax rate or exemption assumed.
       </p>
     </>
+  );
+}
+import type { DealerFeed } from "@/lib/dealers";
+function JewelryEstimator({
+  price,
+}: {
+  price: (purity: number, weight: number, currency: Currency) => number | null;
+}) {
+  const [country, setCountry] = useState<"India" | "Netherlands">("India");
+  const [purity, setPurity] = useState(22);
+  const [productId, setProductId] = useState("");
+  const [raksha, setRaksha] = useState<DealerFeed | null>(null);
+  const [grossWeight, setGrossWeight] = useState(10);
+  const [stoneWeight, setStoneWeight] = useState(0);
+  const [makingPercent, setMakingPercent] = useState(0);
+  const [taxPercent, setTaxPercent] = useState(0);
+  useEffect(() => {
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (active) setProductId(localStorage.getItem("aurum-india-source-product") || "");
+    });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      fetch("/api/dealers")
+        .then((response) => response.json())
+        .then((data) => { if (active) setRaksha(data.raksha); })
+        .catch(() => {});
+    void load();
+    const interval = setInterval(load, 60000);
+    return () => { active = false; clearInterval(interval); };
+  }, []);
+  const currency: Currency = country === "India" ? "INR" : "EUR";
+  const purityOptions = countryPurities[country];
+  const changeCountry = (next: "India" | "Netherlands") => {
+    setCountry(next);
+    if (!countryPurities[next].includes(purity)) setPurity(24);
+  };
+  const rakshaRows = raksha?.rows || [];
+  const matching = rakshaRows.filter((row) => row.fineness === 999);
+  const indianProduct = productId
+    ? rakshaRows.find((row) => row.id === productId)
+    : matching.find((row) => row.gst === "Not stated") || matching[0] || rakshaRows[0];
+  const ratePerGram =
+    country === "India"
+      ? indianProduct && raksha?.unitGrams ? indianProduct.sell !== null ? indianProduct.sell / raksha.unitGrams : null : null
+      : price(purity, 1, currency);
+  const netWeight = Math.max(0, grossWeight - stoneWeight);
+  const goldValue = ratePerGram === null ? null : ratePerGram * netWeight;
+  const making = goldValue === null ? null : goldValue * (makingPercent / 100);
+  const subtotal = goldValue === null || making === null ? null : goldValue + making;
+  const tax = subtotal === null ? null : subtotal * (taxPercent / 100);
+  const total = subtotal === null || tax === null ? null : subtotal + tax;
+  return (
+    <section className="estimator-section" aria-label="Jewelry price estimator">
+      <div className="section-heading">
+        <div>
+          <h2>Jewelry price estimator</h2>
+          <p>Add making charges and tax to the international reference rate</p>
+        </div>
+        <CalculatorIcon size={20} />
+      </div>
+      <div className="form-grid">
+        <Field label="Region">
+          <select value={country} onChange={(event) => changeCountry(event.target.value as "India" | "Netherlands")}>
+            <option value="India">India</option>
+            <option value="Netherlands">Netherlands</option>
+          </select>
+        </Field>
+        {country === "India" ? (
+          <Field label="Source product">
+            <select
+              value={indianProduct?.id || productId}
+              disabled={!rakshaRows.length}
+              onChange={(event) => {
+                setProductId(event.target.value);
+                localStorage.setItem("aurum-india-source-product", event.target.value);
+              }}
+            >
+              {!indianProduct && <option value={productId}>{productId ? "Selected product unavailable" : "No source products"}</option>}
+              {rakshaRows.map((row) => <option key={row.id} value={row.id}>{row.label}</option>)}
+            </select>
+          </Field>
+        ) : (
+          <Field label="Purity">
+            <select value={purity} onChange={(event) => setPurity(Number(event.target.value))}>
+              {purityOptions.map((value) => (
+                <option key={value} value={value}>{purityLabel(value)}</option>
+              ))}
+            </select>
+          </Field>
+        )}
+        <Field label="Gross weight (g)">
+          <input type="number" min="0.001" max="1000000" step="any" value={grossWeight}
+            onChange={(event) => setGrossWeight(Math.max(0, Number(event.target.value)))} />
+        </Field>
+        <Field label="Stone weight (g)">
+          <input type="number" min="0" max="1000000" step="any" value={stoneWeight}
+            onChange={(event) => setStoneWeight(Math.max(0, Number(event.target.value)))} />
+        </Field>
+        <Field label="Making charges (%)">
+          <input type="number" min="0" max="500" step="any" value={makingPercent}
+            onChange={(event) => setMakingPercent(Math.max(0, Number(event.target.value)))} />
+        </Field>
+        <Field label="Tax / VAT (%)">
+          <input type="number" min="0" max="100" step="any" value={taxPercent}
+            onChange={(event) => setTaxPercent(Math.max(0, Number(event.target.value)))} />
+        </Field>
+      </div>
+      <div className="calc-breakdown">
+        <div className="calc-breakdown-row">
+          <span>{country === "India" ? "Raksha source SELL rate" : "International reference rate"}</span>
+          <strong>{money(ratePerGram, currency)} / g</strong>
+        </div>
+        <div className="calc-breakdown-row">
+          <span>Net gold weight</span>
+          <strong>{number(netWeight)} g</strong>
+        </div>
+        <div className="calc-breakdown-row">
+          <span>Gold value ({country === "India" ? indianProduct ? `${indianProduct.fineness} fine` : "source product" : purityLabel(purity)}, net weight)</span>
+          <strong>{money(goldValue, currency)}</strong>
+        </div>
+        <div className="calc-breakdown-row">
+          <span>Making charges ({makingPercent}%)</span>
+          <strong>+{money(making, currency)}</strong>
+        </div>
+        <div className="calc-breakdown-row">
+          <span>Tax / VAT ({taxPercent}%)</span>
+          <strong>+{money(tax, currency)}</strong>
+        </div>
+        <div className="calc-breakdown-row calc-breakdown-total">
+          <span>Total estimate</span>
+          <strong>{money(total, currency)}</strong>
+        </div>
+      </div>
+      <div className="form-actions">
+        <button type="button" className="secondary" onClick={() => window.print()}>
+          <Printer size={15} /> Print estimate
+        </button>
+      </div>
+      <p className="fine-print">
+        {country === "India"
+          ? indianProduct
+            ? `Based on ${indianProduct.label} (${indianProduct.fineness} fine). GST: ${indianProduct.gst}. Source weight assumed ${raksha?.unitGrams || "unknown"}g; not verified by Raksha.`
+            : "No Raksha source product available."
+          : "International reference rate, not a dealer buying price."}{" "}
+        Making charges and tax are the percentages you enter here, not a
+        store or statutory rate; verify both with your jeweler or invoice
+        before purchasing.
+      </p>
+    </section>
   );
 }
 function SourcePanel({ data }: { data: State | null }) {
@@ -1470,6 +2013,22 @@ function Metric({
     <div className={`metric ${className}`}>
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+function FitGauge({ rSquared }: { rSquared: number }) {
+  const percent = Math.round(rSquared * 100);
+  const quality = fitQuality(rSquared);
+  return (
+    <div className="fit-gauge" aria-label={`Model fit: ${percent} percent, ${quality}`}>
+      <div className="fit-gauge-track">
+        <div className={`fit-gauge-fill ${quality.toLowerCase()}`} style={{ width: `${Math.min(100, percent)}%` }} />
+      </div>
+      <div className="fit-gauge-labels">
+        <span>0%</span>
+        <span>How closely the fitted line tracks the real daily prices</span>
+        <span>100%</span>
+      </div>
     </div>
   );
 }
